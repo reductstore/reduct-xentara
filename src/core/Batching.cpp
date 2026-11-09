@@ -9,6 +9,16 @@
 namespace reductstore_xentara
 {
 
+auto Record::storageBytes() const noexcept -> std::size_t
+{
+	auto bytes = sizeof(Record) + entry.capacity() + contentType.capacity() + payload.capacity();
+	for (const auto& [key, value] : labels)
+	{
+		bytes += sizeof(Labels::value_type) + key.capacity() + value.capacity();
+	}
+	return bytes;
+}
+
 BatchPlanner::BatchPlanner(BatchLimits limits) :
 	_limits(std::move(limits))
 {
@@ -50,28 +60,33 @@ BoundedQueue::BoundedQueue(std::size_t maxPayloadBytes, OverflowPolicy policy) :
 
 auto BoundedQueue::push(Record record) -> bool
 {
-	const auto bytes = payloadBytes(record);
+	const auto bytes = storageBytes(record);
 	std::lock_guard lock(_mutex);
 	if (_closed || bytes > _maxPayloadBytes)
 	{
 		++_rejectedRecords;
 		return false;
 	}
-	if (_payloadBytes + bytes > _maxPayloadBytes)
+	if (_residentBytes + bytes > _maxPayloadBytes)
 	{
 		if (_policy == OverflowPolicy::RejectNewest)
 		{
 			++_rejectedRecords;
 			return false;
 		}
-		while (!_records.empty() && _payloadBytes + bytes > _maxPayloadBytes)
+		while (!_records.empty() && _residentBytes + bytes > _maxPayloadBytes)
 		{
-			_payloadBytes -= payloadBytes(_records.front());
+			_residentBytes -= storageBytes(_records.front());
 			_records.pop();
 			++_droppedRecords;
 		}
+		if (_residentBytes + bytes > _maxPayloadBytes)
+		{
+			++_rejectedRecords;
+			return false;
+		}
 	}
-	_payloadBytes += bytes;
+	_residentBytes += bytes;
 	_records.push(std::move(record));
 	_changed.notify_one();
 	return true;
@@ -85,7 +100,6 @@ auto BoundedQueue::tryPop() -> std::optional<Record>
 		return std::nullopt;
 	}
 	auto record = std::move(_records.front());
-	_payloadBytes -= payloadBytes(record);
 	_records.pop();
 	return record;
 }
@@ -99,9 +113,19 @@ auto BoundedQueue::waitPop(std::chrono::milliseconds timeout) -> std::optional<R
 		return std::nullopt;
 	}
 	auto record = std::move(_records.front());
-	_payloadBytes -= payloadBytes(record);
 	_records.pop();
 	return record;
+}
+
+auto BoundedQueue::release(const Record& record) -> void
+{
+	const auto bytes = storageBytes(record);
+	std::lock_guard lock(_mutex);
+	if (bytes > _residentBytes)
+	{
+		throw std::logic_error("released record exceeds reserved queue memory");
+	}
+	_residentBytes -= bytes;
 }
 
 auto BoundedQueue::close() -> void
@@ -117,6 +141,12 @@ auto BoundedQueue::size() const -> std::size_t
 	return _records.size();
 }
 
+auto BoundedQueue::residentBytes() const -> std::size_t
+{
+	std::lock_guard lock(_mutex);
+	return _residentBytes;
+}
+
 auto BoundedQueue::rejectedRecords() const -> std::size_t
 {
 	std::lock_guard lock(_mutex);
@@ -129,9 +159,9 @@ auto BoundedQueue::droppedRecords() const -> std::size_t
 	return _droppedRecords;
 }
 
-auto BoundedQueue::payloadBytes(const Record& record) -> std::size_t
+auto BoundedQueue::storageBytes(const Record& record) -> std::size_t
 {
-	return record.payload.size();
+	return record.storageBytes();
 }
 
 auto UploadResult::success() -> UploadResult
@@ -144,9 +174,9 @@ auto UploadResult::transportFailure(std::string error) -> UploadResult
 	return { false, true, std::move(error), {} };
 }
 
-auto UploadResult::partial(std::vector<std::string> failedEntries) -> UploadResult
+auto UploadResult::partial(std::vector<RecordIdentity> failedRecords) -> UploadResult
 {
-	return { false, false, "partial batch failure", std::move(failedEntries) };
+	return { false, false, "partial batch failure", std::move(failedRecords) };
 }
 
 FilePayload::FilePayload(std::filesystem::path path) :

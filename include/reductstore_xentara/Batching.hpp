@@ -30,6 +30,16 @@ struct Record
 	std::string contentType;
 	std::string payload;
 	Labels labels;
+
+	[[nodiscard]] auto storageBytes() const noexcept -> std::size_t;
+};
+
+struct RecordIdentity
+{
+	std::string entry;
+	TimePoint timestamp;
+
+	auto operator==(const RecordIdentity&) const -> bool = default;
 };
 
 struct BatchLimits
@@ -62,20 +72,22 @@ public:
 	auto push(Record record) -> bool;
 	[[nodiscard]] auto tryPop() -> std::optional<Record>;
 	[[nodiscard]] auto waitPop(std::chrono::milliseconds timeout) -> std::optional<Record>;
+	auto release(const Record& record) -> void;
 	auto close() -> void;
 	[[nodiscard]] auto size() const -> std::size_t;
+	[[nodiscard]] auto residentBytes() const -> std::size_t;
 	[[nodiscard]] auto rejectedRecords() const -> std::size_t;
 	[[nodiscard]] auto droppedRecords() const -> std::size_t;
 
 private:
-	[[nodiscard]] static auto payloadBytes(const Record& record) -> std::size_t;
+	[[nodiscard]] static auto storageBytes(const Record& record) -> std::size_t;
 
 	std::size_t _maxPayloadBytes;
 	OverflowPolicy _policy;
 	mutable std::mutex _mutex;
 	std::condition_variable _changed;
 	std::queue<Record> _records;
-	std::size_t _payloadBytes { 0 };
+	std::size_t _residentBytes { 0 };
 	std::size_t _rejectedRecords { 0 };
 	std::size_t _droppedRecords { 0 };
 	bool _closed { false };
@@ -86,11 +98,11 @@ struct UploadResult
 	bool delivered { false };
 	bool retryable { false };
 	std::string error;
-	std::vector<std::string> failedEntries;
+	std::vector<RecordIdentity> failedRecords;
 
 	[[nodiscard]] static auto success() -> UploadResult;
 	[[nodiscard]] static auto transportFailure(std::string error) -> UploadResult;
-	[[nodiscard]] static auto partial(std::vector<std::string> failedEntries) -> UploadResult;
+	[[nodiscard]] static auto partial(std::vector<RecordIdentity> failedRecords) -> UploadResult;
 };
 
 template <typename Upload>

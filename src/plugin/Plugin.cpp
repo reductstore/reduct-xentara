@@ -35,8 +35,11 @@ using namespace xentara::literals;
 
 const model::Attribute kHealthy { "98915e48-f6d9-4954-9d33-e91ffca468f9"_uuid, "healthy"sv, model::Attribute::Access::ReadOnly, data::DataType::kBoolean };
 const model::Attribute kQueuedRecords { "fe3d61a2-8720-4ce7-948a-bf22ad5dbb1f"_uuid, "queuedRecords"sv, model::Attribute::Access::ReadOnly, data::DataType::kInteger };
+const model::Attribute kQueuedBytes { "b6350cac-b1ae-44a4-b5ef-5b4d2fb5c2d5"_uuid, "queuedBytes"sv, model::Attribute::Access::ReadOnly, data::DataType::kInteger };
 const model::Attribute kRejectedRecords { "a065417d-5e59-4db7-9707-7d03e1f9af17"_uuid, "rejectedRecords"sv, model::Attribute::Access::ReadOnly, data::DataType::kInteger };
-const model::Attribute kSendTime { "9643450e-5f8b-4ab2-a1f5-a13d181d9478"_uuid, "sendTime"sv, model::Attribute::Access::ReadOnly, data::DataType::kTimeStamp };
+const model::Attribute kDroppedRecords { "a55ee685-69e2-4e9d-b889-64c64eeb6024"_uuid, "droppedRecords"sv, model::Attribute::Access::ReadOnly, data::DataType::kInteger };
+const model::Attribute kFailedRecords { "55c99df4-78e5-4c6a-9d93-870d71a67b5a"_uuid, "failedRecords"sv, model::Attribute::Access::ReadOnly, data::DataType::kInteger };
+const model::Attribute kLastSuccessfulSendTime { "b33cac6d-19b0-4fc5-b8b9-1c8abcf57cf0"_uuid, "lastSuccessfulSendTime"sv, model::Attribute::Access::ReadOnly, data::DataType::kTimeStamp };
 const model::Attribute kError { model::Attribute::kError, model::Attribute::Access::ReadOnly, data::DataType::kErrorCode };
 const process::Event::Role kSent { "c0d111f6-2f1b-497a-bcaf-837c6f56add6"_uuid, "sent"sv };
 const process::Event::Role kSendError { "d0bee531-3595-466f-96bd-6f7dcc0ad09f"_uuid, "sendError"sv };
@@ -151,7 +154,8 @@ ReductWriter::ReductWriter(std::reference_wrapper<ReductClient> client) :
 
 auto ReductWriter::forEachAttribute(const model::ForEachAttributeFunction& function) const -> bool
 {
-	return function(kHealthy) || function(kQueuedRecords) || function(kRejectedRecords) || function(kSendTime) || function(kError);
+	return function(kHealthy) || function(kQueuedRecords) || function(kQueuedBytes) || function(kRejectedRecords) ||
+		function(kDroppedRecords) || function(kFailedRecords) || function(kLastSuccessfulSendTime) || function(kError);
 }
 
 auto ReductWriter::forEachEvent(const model::ForEachEventFunction& function) -> bool
@@ -168,9 +172,11 @@ auto ReductWriter::makeReadHandle(const model::Attribute& attribute) const noexc
 {
 	if (attribute == kHealthy) return _state.member(&State::healthy);
 	if (attribute == kQueuedRecords) return _state.member(&State::queuedRecords);
+	if (attribute == kQueuedBytes) return _state.member(&State::queuedBytes);
 	if (attribute == kRejectedRecords) return _state.member(&State::rejectedRecords);
-	if (attribute == kSendTime) return _state.member(&State::sendTime);
-	if (attribute == kError) return _state.member(&State::error);
+	if (attribute == kDroppedRecords) return _state.member(&State::droppedRecords);
+	if (attribute == kFailedRecords) return _state.member(&State::failedRecords);
+	if (attribute == kLastSuccessfulSendTime) return _state.member(&State::lastSuccessfulSendTime);
 	return std::nullopt;
 }
 
@@ -309,9 +315,12 @@ auto ReductWriter::updateState(std::chrono::system_clock::time_point timestamp) 
 	auto& state = *sentinel;
 	state.healthy = status.connected && status.error.empty();
 	state.queuedRecords = status.queuedRecords;
-	state.rejectedRecords = _client.get().worker().rejectedRecords() + _client.get().worker().droppedRecords();
+	state.queuedBytes = status.queuedBytes;
+	state.rejectedRecords = _client.get().worker().rejectedRecords();
+	state.droppedRecords = _client.get().worker().droppedRecords();
+	state.failedRecords = status.failedRecords;
 	state.error = status.error.empty() ? std::error_code {} : std::make_error_code(std::errc::io_error);
-	state.sendTime = timestamp;
+	state.lastSuccessfulSendTime = status.lastSuccessfulSendTime;
 	if (status.deliveredRecords > _observedDelivered)
 	{
 		_observedDelivered = status.deliveredRecords;

@@ -1,6 +1,7 @@
 #include "reductstore_xentara/Batching.hpp"
 #include "reductstore_xentara/Configuration.hpp"
 #include "reductstore_xentara/Serialization.hpp"
+#include "reductstore_xentara/Transmission.hpp"
 
 #include <chrono>
 #include <cstdint>
@@ -72,16 +73,31 @@ void selectsBatchBoundaries()
 	check(planner.take().size() == 2, "the planner must keep multiple entries together");
 }
 
-void rejectsOverflowWithoutDiscardingQueuedRecords()
+void accountsForMetadataAndInflightRecords()
 {
-	BoundedQueue queue(4, OverflowPolicy::RejectNewest);
-	check(queue.push(Record { "a", {}, "application/json", "1234", {} }), "the first record must fit");
-	check(!queue.push(Record { "b", {}, "application/json", "1", {} }), "a full queue must reject the new record");
-	check(queue.size() == 1, "overflow must preserve queued records");
-	check(queue.rejectedRecords() == 1, "queue loss must be observable");
+	const Record record { "edge-01/telemetry/temperature", {}, "application/json", "1234", { { "host", "edge-01" }, { "source", "Sensors.Temperature" } } };
+	BoundedQueue queue(record.storageBytes(), OverflowPolicy::RejectNewest);
+	check(queue.push(record), "a record must fit within its exact queue budget");
+	auto inflight = queue.tryPop();
+	check(inflight.has_value(), "the queued record must become in-flight");
+	check(queue.residentBytes() == record.storageBytes(), "in-flight records must remain in the memory budget");
+	check(!queue.push(record), "a second record must be rejected while the first is in-flight");
+	queue.release(*inflight);
+	check(queue.residentBytes() == 0, "delivered records must release the complete memory reservation");
+	check(queue.push(record), "released memory must accept a new record");
 }
 
-void retriesTransientFailuresAndPreservesPartialFailures()
+void preservesPartialBatchRecordIdentity()
+{
+	const auto timestamp = TimePoint(std::chrono::nanoseconds(123));
+	const auto partial = UploadResult::partial({ { "entry-a", timestamp } });
+	check(!partial.delivered, "partial write errors must not be marked as delivered");
+	check(partial.failedRecords.size() == 1, "partial failures must retain record identities");
+	check(partial.failedRecords.front().entry == "entry-a", "partial failures must retain the failed entry");
+	check(partial.failedRecords.front().timestamp == timestamp, "partial failures must retain the failed timestamp");
+}
+
+void retriesTransientFailures()
 {
 	RetryPolicy retry { 3, std::chrono::milliseconds(0), std::chrono::milliseconds(0) };
 	std::size_t attempts = 0;
@@ -91,10 +107,22 @@ void retriesTransientFailuresAndPreservesPartialFailures()
 	});
 	check(result.delivered, "a retry succeeding within the bound must be delivered");
 	check(attempts == 3, "transient failures must use the configured retry bound");
+}
 
-	const auto partial = UploadResult::partial({ "entry-a" });
-	check(!partial.delivered, "partial write errors must not be marked as delivered");
-	check(partial.failedEntries.size() == 1, "partial failures must retain failed entries");
+void rejectsOverflowWithoutDiscardingQueuedRecords()
+{
+	const Record first { "a", {}, "application/json", "1234", {} };
+	BoundedQueue queue(first.storageBytes(), OverflowPolicy::RejectNewest);
+	check(queue.push(first), "the first record must fit");
+	check(!queue.push(Record { "b", {}, "application/json", "1", {} }), "a full queue must reject the new record");
+	check(queue.size() == 1, "overflow must preserve queued records");
+	check(queue.rejectedRecords() == 1, "queue loss must be observable");
+}
+
+void retriesTransientFailuresAndPreservesPartialFailures()
+{
+	retriesTransientFailures();
+	preservesPartialBatchRecordIdentity();
 }
 
 void streamsFilesInBoundedChunks()
@@ -122,6 +150,23 @@ void streamsFilesInBoundedChunks()
 	std::filesystem::remove(file);
 }
 
+void releasesPendingRecordsOnShutdown()
+{
+	ClientConfiguration configuration;
+	configuration.serverUrl = "http://127.0.0.1:1";
+	configuration.bucket = "test";
+	configuration.connectionTimeout = std::chrono::milliseconds(10);
+	configuration.requestTimeout = std::chrono::milliseconds(10);
+	configuration.retry.maxAttempts = 1;
+	configuration.maxBatchAge = std::chrono::milliseconds(0);
+	UplinkWorker worker(configuration);
+	worker.start();
+	check(worker.enqueue(Record { "entry", TimePoint::clock::now(), "application/json", "1", {} }), "the record must enter the worker queue");
+	worker.stop();
+	check(worker.status().queuedBytes == 0, "shutdown must release undelivered record reservations");
+	check(worker.status().failedRecords == 1, "shutdown must expose the undelivered record count");
+}
+
 }
 
 int main()
@@ -131,8 +176,10 @@ int main()
 		{ "serializes numeric measurements", serializesNumericMeasurements },
 		{ "preserves timestamp precision", preservesTimestampPrecision },
 		{ "selects batch boundaries", selectsBatchBoundaries },
+		{ "accounts for metadata and in-flight records", accountsForMetadataAndInflightRecords },
 		{ "rejects queue overflow", rejectsOverflowWithoutDiscardingQueuedRecords },
 		{ "retries transient failures", retriesTransientFailuresAndPreservesPartialFailures },
+		{ "releases pending records on shutdown", releasesPendingRecordsOnShutdown },
 		{ "streams files in bounded chunks", streamsFilesInBoundedChunks },
 	};
 

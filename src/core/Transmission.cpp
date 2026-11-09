@@ -92,15 +92,15 @@ auto ReductTransport::writeBatch(const std::vector<Record>& records) -> UploadRe
 		}
 		if (!result.result.empty())
 		{
-			std::vector<std::string> failedEntries;
+			std::vector<RecordIdentity> failedRecords;
 			for (const auto& [entry, errors] : result.result)
 			{
-				if (!errors.empty())
+				for (const auto& [timestamp, error] : errors)
 				{
-					failedEntries.push_back(entry);
+					failedRecords.push_back({ entry, timestamp });
 				}
 			}
-			return UploadResult::partial(std::move(failedEntries));
+			return UploadResult::partial(std::move(failedRecords));
 		}
 		return UploadResult::success();
 	}
@@ -184,6 +184,7 @@ auto UplinkWorker::status() const -> DeliveryStatus
 	std::lock_guard lock(_statusMutex);
 	auto status = _status;
 	status.queuedRecords = _queue.size();
+	status.queuedBytes = _queue.residentBytes();
 	return status;
 }
 
@@ -208,42 +209,93 @@ auto UplinkWorker::run() -> void
 {
 	BatchPlanner planner({ _configuration.maxBatchRecords, _configuration.maxBatchPayloadBytes, _configuration.maxBatchAge });
 	ReductTransport transport(_configuration);
-	while (_running || !planner.empty() || _queue.size() != 0)
+	std::vector<Record> pending;
+	std::optional<std::chrono::steady_clock::time_point> shutdownDeadline;
+	while (_running || !planner.empty() || _queue.size() != 0 || !pending.empty())
 	{
-		if (auto record = _queue.waitPop(std::chrono::milliseconds(50)))
+		if (!_running && !shutdownDeadline)
 		{
-			planner.push(std::move(*record), std::chrono::steady_clock::now());
+			shutdownDeadline = std::chrono::steady_clock::now() + _configuration.requestTimeout;
 		}
-		if (planner.empty())
+		if (shutdownDeadline && std::chrono::steady_clock::now() >= *shutdownDeadline)
 		{
-			continue;
+			auto undelivered = pending.size();
+			for (const auto& record : pending)
+			{
+				_queue.release(record);
+			}
+			for (const auto& record : planner.take())
+			{
+				_queue.release(record);
+				++undelivered;
+			}
+			while (auto record = _queue.tryPop())
+			{
+				_queue.release(*record);
+				++undelivered;
+			}
+			{
+				std::lock_guard lock(_statusMutex);
+				_status.failedRecords = undelivered;
+			}
+			setFailure("shutdown final flush timed out with undelivered records");
+			return;
 		}
-		if (!_flushRequested.exchange(false) && !planner.shouldFlush(std::chrono::steady_clock::now()) && _running)
+		if (pending.empty())
 		{
-			continue;
+			if (auto record = _queue.waitPop(std::chrono::milliseconds(50)))
+			{
+				planner.push(std::move(*record), std::chrono::steady_clock::now());
+			}
+			if (planner.empty())
+			{
+				continue;
+			}
+			if (!_flushRequested.exchange(false) && !planner.shouldFlush(std::chrono::steady_clock::now()) && _running)
+			{
+				continue;
+			}
+			pending = planner.take();
 		}
-		auto batch = planner.take();
-		auto result = retryTransient(_configuration.retry, [&transport, &batch] { return transport.writeBatch(batch); });
+		auto result = retryTransient(_configuration.retry, [&transport, &pending] { return transport.writeBatch(pending); });
 		if (result.delivered)
 		{
+			for (const auto& record : pending)
+			{
+				_queue.release(record);
+			}
 			std::lock_guard lock(_statusMutex);
 			_status.connected = true;
 			_status.error.clear();
-			_status.deliveredRecords += batch.size();
+			_status.deliveredRecords += pending.size();
+			_status.failedRecords = 0;
+			_status.lastSuccessfulSendTime = TimePoint::clock::now();
+			pending.clear();
 			continue;
+		}
+		if (!result.failedRecords.empty())
+		{
+			std::vector<Record> failed;
+			failed.reserve(result.failedRecords.size());
+			for (auto& record : pending)
+			{
+				const RecordIdentity identity { record.entry, record.timestamp };
+				if (std::ranges::find(result.failedRecords, identity) != result.failedRecords.end())
+				{
+					failed.push_back(std::move(record));
+				}
+				else
+				{
+					_queue.release(record);
+				}
+			}
+			pending = std::move(failed);
 		}
 		{
 			std::lock_guard lock(_statusMutex);
-			_status.failedRecords += batch.size();
+			_status.failedRecords = pending.size();
 		}
 		setFailure(result.error);
-		for (auto& record : batch)
-		{
-			if (!_queue.push(std::move(record)))
-			{
-				setFailure("failed records could not be retained because the queue is full");
-			}
-		}
 		std::this_thread::sleep_for(_configuration.retry.maximumBackoff);
 	}
 }

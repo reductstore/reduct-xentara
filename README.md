@@ -38,7 +38,7 @@ xentara --plugin build/reductstore-xentara.json --model examples/model.json
 | `maxBatchRecords` | integer | `256` | Small-record batch limit |
 | `maxBatchPayloadBytes` | integer | `4194304` | Small-record batch payload limit |
 | `maxBatchAge` | duration | `2s` | Maximum age before flush |
-| `maxQueueBytes` | integer | `16777216` | In-memory payload queue budget |
+| `maxQueueBytes` | integer | `16777216` | Memory budget for queued and in-flight record payloads and metadata |
 | `overflowPolicy` | string | `rejectNewest` | `rejectNewest` or `dropOldest` |
 | `retry.maxAttempts` | integer | `3` | Bounded attempts per send cycle |
 | `retry.initialBackoff` | duration | `100ms` | Initial retry delay |
@@ -54,7 +54,7 @@ The writer adds `source`, `quality`, and configured `host` labels. It serializes
 
 The collection task only reads, serializes, and enqueues. A worker thread performs all network I/O. It flushes on 256 records, 4 MiB, or two seconds by default using multi-entry `IBucket::WriteBatch()`. File payloads above the batch threshold use `IBucket::Write()` with the SDK callback and bounded chunks. The total file length is determined before upload.
 
-The queue records rejected and dropped records through the writer status attributes and `sendError` event. `rejectNewest` preserves already queued data. `dropOldest` exposes its losses through the same counter. Process crashes lose the in-memory queue. The worker retains failed batches for later retries; if a full queue prevents retention, it reports an explicit failure. ReductStore records are immutable. A transport failure after the server accepts data is ambiguous: the skill never marks it delivered without an SDK success response, so an operator may need to resolve a duplicate-timestamp conflict before retrying.
+The queue reserves memory for every queued and in-flight record, including entries, content types, and labels. Writer attributes expose `queuedBytes`, `queuedRecords`, `failedRecords`, `rejectedRecords`, `droppedRecords`, and `lastSuccessfulSendTime`; rejected and dropped records also raise `sendError`. `rejectNewest` increments `rejectedRecords` and preserves already reserved data. `dropOldest` increments `droppedRecords`. Process crashes lose the in-memory queue. Failed batches remain reserved while the worker retries them. Shutdown uses the configured request timeout and bounded retry count, then releases reservations and reports undelivered data. ReductStore records are immutable. A transport failure after the server accepts data is ambiguous: the skill never marks it delivered without an SDK success response, so an operator may need to resolve a duplicate-timestamp conflict before retrying.
 
 ## Local demo
 

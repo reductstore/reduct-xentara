@@ -65,9 +65,12 @@ private:
 	{
 		bool healthy { false };
 		std::uint64_t queuedRecords { 0 };
+		std::uint64_t queuedBytes { 0 };
 		std::uint64_t rejectedRecords { 0 };
+		std::uint64_t droppedRecords { 0 };
+		std::uint64_t failedRecords { 0 };
 		std::error_code error;
-		std::chrono::system_clock::time_point sendTime { std::chrono::system_clock::time_point::min() };
+		std::chrono::system_clock::time_point lastSuccessfulSendTime { std::chrono::system_clock::time_point::min() };
 	};
 
 	struct Mapping

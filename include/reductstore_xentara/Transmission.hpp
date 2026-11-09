@@ -19,6 +19,8 @@ struct DeliveryStatus
 	std::size_t deliveredRecords { 0 };
 	std::size_t failedRecords { 0 };
 	std::size_t queuedRecords { 0 };
+	std::size_t queuedBytes { 0 };
+	TimePoint lastSuccessfulSendTime { TimePoint::min() };
 	std::string error;
 };
 
