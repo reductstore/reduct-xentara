@@ -213,6 +213,19 @@ auto ReductWriter::Mapping::resolve() -> void
 	}
 }
 
+auto ReductWriter::Mapping::valuePayload() const -> std::optional<std::string>
+{
+	switch (value.nativeType())
+	{
+	case data::NativeType::Boolean: { auto item = value.read<bool>(); if (item) return reductstore_xentara::serializeScalar(*item); break; }
+	case data::NativeType::Integer: { auto item = value.read<std::intmax_t>(); if (item) return reductstore_xentara::serializeScalar(*item); break; }
+	case data::NativeType::UnsignedInteger: { auto item = value.read<std::uintmax_t>(); if (item) return reductstore_xentara::serializeScalar(*item); break; }
+	case data::NativeType::FloatingPoint: { auto item = value.read<double>(); if (item) return reductstore_xentara::serializeScalar(*item); break; }
+	default: break;
+	}
+	return std::nullopt;
+}
+
 auto ReductWriter::Mapping::collect(std::chrono::system_clock::time_point scheduledTime, const std::string& host) -> std::optional<reductstore_xentara::Record>
 {
 	auto recordTimestamp = scheduledTime;
@@ -223,15 +236,8 @@ auto ReductWriter::Mapping::collect(std::chrono::system_clock::time_point schedu
 		recordTimestamp = *valueTimestamp;
 		if (lastTimestamp == recordTimestamp) return std::nullopt;
 	}
-	std::string payload;
-	switch (value.nativeType())
-	{
-	case data::NativeType::Boolean: { auto item = value.read<bool>(); if (!item) return std::nullopt; payload = reductstore_xentara::serializeScalar(*item); break; }
-	case data::NativeType::Integer: { auto item = value.read<std::intmax_t>(); if (!item) return std::nullopt; payload = reductstore_xentara::serializeScalar(*item); break; }
-	case data::NativeType::UnsignedInteger: { auto item = value.read<std::uintmax_t>(); if (!item) return std::nullopt; payload = reductstore_xentara::serializeScalar(*item); break; }
-	case data::NativeType::FloatingPoint: { auto item = value.read<double>(); if (!item) return std::nullopt; payload = reductstore_xentara::serializeScalar(*item); break; }
-	default: return std::nullopt;
-	}
+	auto payload = valuePayload();
+	if (!payload) return std::nullopt;
 	auto qualityValue = quality.read<data::Quality>();
 	if (!qualityValue) return std::nullopt;
 	auto recordLabels = labels;
@@ -239,45 +245,133 @@ auto ReductWriter::Mapping::collect(std::chrono::system_clock::time_point schedu
 	recordLabels["source"] = source;
 	if (!host.empty()) recordLabels["host"] = host;
 	lastTimestamp = recordTimestamp;
-	return reductstore_xentara::Record { entry, recordTimestamp, "application/json", std::move(payload), std::move(recordLabels) };
+	return reductstore_xentara::Record { entry, recordTimestamp, "application/json", std::move(*payload), std::move(recordLabels) };
+}
+
+auto ReductWriter::Snapshot::resolve() -> void
+{
+	for (auto& field : fields) field.resolve();
+}
+
+auto ReductWriter::Snapshot::collect(std::chrono::system_clock::time_point scheduledTime, const std::string& host) const -> std::optional<reductstore_xentara::Record>
+{
+	std::vector<std::pair<std::string, std::string>> values;
+	values.reserve(fields.size());
+	for (const auto& field : fields)
+	{
+		auto value = field.valuePayload();
+		if (!value) return std::nullopt;
+		values.emplace_back(field.name, std::move(*value));
+	}
+	auto recordLabels = labels;
+	if (!host.empty()) recordLabels["host"] = host;
+	return reductstore_xentara::Record {
+		entry,
+		scheduledTime,
+		"application/json",
+		reductstore_xentara::serializeObject(values),
+		std::move(recordLabels),
+	};
 }
 
 auto ReductWriter::load(utils::json::decoder::Object& object, config::Context& context) -> void
 {
 	for (auto&& [name, value] : object)
 	{
-		if (name != "records"sv)
+		if (name == "records"sv)
+		{
+			for (auto&& item : value.asArray())
+			{
+				Mapping mapping;
+				bool dataPointLoaded = false;
+				bool entryLoaded = false;
+				for (auto&& [recordName, recordValue] : item.asObject())
+				{
+					if (recordName == "dataPoint"sv) { context.resolve<model::Element>(recordValue, std::ref(mapping.dataPoint)); dataPointLoaded = true; }
+					else if (recordName == "entry"sv) { mapping.entry = recordValue.asString<std::string>(); entryLoaded = !mapping.entry.empty(); }
+					else if (recordName == "timestampSource"sv)
+					{
+						const auto source = recordValue.asString<std::string>();
+						if (source == "scheduled") mapping.timestampSource = Mapping::TimestampSource::Scheduled;
+						else if (source == "sourceTime") mapping.timestampSource = Mapping::TimestampSource::Source;
+						else if (source == "updateTime") mapping.timestampSource = Mapping::TimestampSource::Update;
+						else throw std::runtime_error("timestampSource must be scheduled, sourceTime, or updateTime");
+					}
+					else if (recordName == "labels"sv)
+					{
+						for (auto&& [label, labelValue] : recordValue.asObject()) mapping.labels.emplace(std::string(label), labelValue.asString<std::string>());
+					}
+					else config::throwUnknownParameterError(recordName);
+				}
+				if (!dataPointLoaded || !entryLoaded) throw std::runtime_error("each writer record requires dataPoint and non-empty entry");
+				_mappings.push_back(std::move(mapping));
+			}
+		}
+		else if (name == "recordGroups"sv)
+		{
+			for (auto&& item : value.asArray())
+			{
+				Snapshot snapshot;
+				bool modeLoaded = false;
+				bool entryLoaded = false;
+				bool fieldsLoaded = false;
+				for (auto&& [groupName, groupValue] : item.asObject())
+				{
+					if (groupName == "mode"sv)
+					{
+						modeLoaded = true;
+						if (groupValue.asString<std::string>() != "snapshot") throw std::runtime_error("record group mode must be snapshot");
+					}
+					else if (groupName == "entry"sv)
+					{
+						snapshot.entry = groupValue.asString<std::string>();
+						entryLoaded = !snapshot.entry.empty();
+					}
+					else if (groupName == "timestampSource"sv)
+					{
+						if (groupValue.asString<std::string>() != "scheduled") throw std::runtime_error("snapshot record groups require timestampSource scheduled");
+					}
+					else if (groupName == "labels"sv)
+					{
+						for (auto&& [label, labelValue] : groupValue.asObject()) snapshot.labels.emplace(std::string(label), labelValue.asString<std::string>());
+					}
+					else if (groupName == "fields"sv)
+					{
+						fieldsLoaded = true;
+						for (auto&& fieldValue : groupValue.asArray())
+						{
+							Mapping field;
+							bool dataPointLoaded = false;
+							bool nameLoaded = false;
+							for (auto&& [fieldName, fieldSetting] : fieldValue.asObject())
+							{
+								if (fieldName == "name"sv) { field.name = fieldSetting.asString<std::string>(); nameLoaded = !field.name.empty(); }
+								else if (fieldName == "dataPoint"sv) { context.resolve<model::Element>(fieldSetting, std::ref(field.dataPoint)); dataPointLoaded = true; }
+								else config::throwUnknownParameterError(fieldName);
+							}
+							if (!nameLoaded || !dataPointLoaded) throw std::runtime_error("each snapshot field requires name and dataPoint");
+							for (const auto& existing : snapshot.fields)
+							{
+								if (existing.name == field.name) throw std::runtime_error("snapshot field names must be unique");
+							}
+							snapshot.fields.push_back(std::move(field));
+						}
+					}
+					else config::throwUnknownParameterError(groupName);
+				}
+				if (!modeLoaded || !entryLoaded || !fieldsLoaded || snapshot.fields.empty())
+				{
+					throw std::runtime_error("each snapshot record group requires mode, non-empty entry, and fields");
+				}
+				_snapshots.push_back(std::move(snapshot));
+			}
+		}
+		else
 		{
 			config::throwUnknownParameterError(name);
 		}
-		for (auto&& item : value.asArray())
-		{
-			Mapping mapping;
-			bool dataPointLoaded = false;
-			bool entryLoaded = false;
-			for (auto&& [recordName, recordValue] : item.asObject())
-			{
-				if (recordName == "dataPoint"sv) { context.resolve<model::Element>(recordValue, std::ref(mapping.dataPoint)); dataPointLoaded = true; }
-				else if (recordName == "entry"sv) { mapping.entry = recordValue.asString<std::string>(); entryLoaded = !mapping.entry.empty(); }
-				else if (recordName == "timestampSource"sv)
-				{
-					const auto source = recordValue.asString<std::string>();
-					if (source == "scheduled") mapping.timestampSource = Mapping::TimestampSource::Scheduled;
-					else if (source == "sourceTime") mapping.timestampSource = Mapping::TimestampSource::Source;
-					else if (source == "updateTime") mapping.timestampSource = Mapping::TimestampSource::Update;
-					else throw std::runtime_error("timestampSource must be scheduled, sourceTime, or updateTime");
-				}
-				else if (recordName == "labels"sv)
-				{
-					for (auto&& [label, labelValue] : recordValue.asObject()) mapping.labels.emplace(std::string(label), labelValue.asString<std::string>());
-				}
-				else config::throwUnknownParameterError(recordName);
-			}
-			if (!dataPointLoaded || !entryLoaded) throw std::runtime_error("each writer record requires dataPoint and non-empty entry");
-			_mappings.push_back(std::move(mapping));
-		}
 	}
-	if (_mappings.empty()) throw std::runtime_error("writer requires at least one record");
+	if (_mappings.empty() && _snapshots.empty()) throw std::runtime_error("writer requires at least one record or record group");
 }
 
 auto ReductWriter::realize() -> void
@@ -288,6 +382,7 @@ auto ReductWriter::realize() -> void
 auto ReductWriter::prepare() -> void
 {
 	for (auto& mapping : _mappings) mapping.resolve();
+	for (auto& snapshot : _snapshots) snapshot.resolve();
 }
 
 auto ReductWriter::collect(const process::ExecutionContext& context) -> void
@@ -295,6 +390,13 @@ auto ReductWriter::collect(const process::ExecutionContext& context) -> void
 	for (auto& mapping : _mappings)
 	{
 		if (auto record = mapping.collect(context.scheduledTime(), _client.get().host()))
+		{
+			(void)_client.get().worker().enqueue(std::move(*record));
+		}
+	}
+	for (const auto& snapshot : _snapshots)
+	{
+		if (auto record = snapshot.collect(context.scheduledTime(), _client.get().host()))
 		{
 			(void)_client.get().worker().enqueue(std::move(*record));
 		}

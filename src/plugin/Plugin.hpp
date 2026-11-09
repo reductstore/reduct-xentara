@@ -78,6 +78,7 @@ private:
 		enum class TimestampSource { Scheduled, Source, Update };
 		std::weak_ptr<const model::Element> dataPoint;
 		std::string entry;
+		std::string name;
 		reductstore_xentara::Labels labels;
 		TimestampSource timestampSource { TimestampSource::Scheduled };
 		data::ReadHandle value;
@@ -87,7 +88,18 @@ private:
 		std::string source;
 
 		auto resolve() -> void;
+		[[nodiscard]] auto valuePayload() const -> std::optional<std::string>;
 		[[nodiscard]] auto collect(std::chrono::system_clock::time_point scheduledTime, const std::string& host) -> std::optional<reductstore_xentara::Record>;
+	};
+
+	struct Snapshot
+	{
+		std::string entry;
+		reductstore_xentara::Labels labels;
+		std::vector<Mapping> fields;
+
+		auto resolve() -> void;
+		[[nodiscard]] auto collect(std::chrono::system_clock::time_point scheduledTime, const std::string& host) const -> std::optional<reductstore_xentara::Record>;
 	};
 
 	class CollectTask final : public process::Task
@@ -119,6 +131,7 @@ private:
 
 	std::reference_wrapper<ReductClient> _client;
 	std::vector<Mapping> _mappings;
+	std::vector<Snapshot> _snapshots;
 	process::Event _sent;
 	process::Event _error;
 	CollectTask _collectTask;

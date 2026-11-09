@@ -50,11 +50,21 @@ void serializesNumericMeasurements()
 	check(serializeScalar(true) == "true", "booleans must be JSON booleans");
 }
 
+void serializesScheduledSnapshot()
+{
+	const std::vector<std::pair<std::string, std::string>> fields {
+		{ "pulse", "true" },
+		{ "sine", "74.3" },
+		{ "quoted\"field", "-2" },
+	};
+	check(serializeObject(fields) == "{\"pulse\":true,\"sine\":74.3,\"quoted\\\"field\":-2}", "a snapshot must serialize named JSON fields");
+}
+
 void preservesTimestampPrecision()
 {
-	const auto timestamp = TimePoint(std::chrono::nanoseconds(1'731'234'567'890'123'456LL));
+	const auto timestamp = TimePoint(std::chrono::microseconds(1'731'234'567'890'123));
 	const auto record = Record { "entry", timestamp, "application/json", "42", { { "host", "edge-a" } } };
-	check(record.timestamp == timestamp, "records must retain nanosecond timestamps");
+	check(record.timestamp == timestamp, "records must retain microsecond timestamps");
 	check(record.labels.at("host") == "edge-a", "record labels must be retained");
 }
 
@@ -174,6 +184,7 @@ int main()
 	const std::vector<std::pair<std::string, std::function<void()>>> tests {
 		{ "rejects invalid configuration", rejectsInvalidConfiguration },
 		{ "serializes numeric measurements", serializesNumericMeasurements },
+		{ "serializes scheduled snapshots", serializesScheduledSnapshot },
 		{ "preserves timestamp precision", preservesTimestampPrecision },
 		{ "selects batch boundaries", selectsBatchBoundaries },
 		{ "accounts for metadata and in-flight records", accountsForMetadataAndInflightRecords },

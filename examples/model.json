@@ -79,13 +79,20 @@
             "@Skill.ReductStore.Writer": {
               "name": "Writer",
               "UUID": "8aaec43f-6419-4af2-a6be-31b1ac9c92ea",
-              "records": [
-                { "dataPoint": "Signals.Pulse", "entry": "signals/pulse", "timestampSource": "scheduled" },
-                { "dataPoint": "Signals.Sine Wave", "entry": "signals/sine", "timestampSource": "scheduled" },
-                { "dataPoint": "Signals.Triangle", "entry": "signals/triangle", "timestampSource": "scheduled" },
-                { "dataPoint": "Signals.Saw-Tooth", "entry": "signals/saw-tooth", "timestampSource": "scheduled" },
-                { "dataPoint": "Signals.Inverted Saw-Tooth", "entry": "signals/inverted-saw-tooth", "timestampSource": "scheduled" },
-                { "dataPoint": "Signals.Noise", "entry": "signals/noise", "timestampSource": "scheduled" }
+              "recordGroups": [
+                {
+                  "mode": "snapshot",
+                  "entry": "signals/snapshot",
+                  "timestampSource": "scheduled",
+                  "fields": [
+                    { "name": "pulse", "dataPoint": "Signals.Pulse" },
+                    { "name": "sine", "dataPoint": "Signals.Sine Wave" },
+                    { "name": "triangle", "dataPoint": "Signals.Triangle" },
+                    { "name": "sawTooth", "dataPoint": "Signals.Saw-Tooth" },
+                    { "name": "invertedSawTooth", "dataPoint": "Signals.Inverted Saw-Tooth" },
+                    { "name": "noise", "dataPoint": "Signals.Noise" }
+                  ]
+                }
               ]
             }
           }
