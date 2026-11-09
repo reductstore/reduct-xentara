@@ -1,68 +1,100 @@
-# Batch Processing Data Uplink Template for Xentara
-This repository contains skeleton code for a Xentara data uplink with the following features:
+# ReductStore Skill for Xentara
 
-Connection based | Batch processing
-:--------------: | :--------------:
-NO               | YES
+A C++20 Xentara 2.1.1 plugin that writes scalar Xentara measurements to [ReductStore](https://www.reduct.store/). It is based on `xentara/xentara-template-uplink-batch`; original embedded ocean copyright and Boost Software License 1.0 notices are retained in the template-derived source.
 
-## Prerequisites
+## Requirements
 
-This skill template requires the Xentara development environment, as well as a Xentara licence. You can get a Xentara
-licence in the [Xentara Online Shop](https://www.xentara.io/product/xentara-for-industrial-automation/).
+- Ubuntu 24.04 AMD64
+- Xentara Runtime and `xentara-dev` 2.1.1
+- CMake 3.25 or newer, a C++20 compiler, OpenSSL development headers
+- Docker Compose for the local demo
 
-The documentation for Xentara can be found at https://docs.xentara.io/xentara.
+The build pins `reduct-cpp` v1.21.3 to commit `6bddc6ac7d428f8c9313967ca87865b2a243ab02`. ReductStore is pinned to `reduct/store:v1.21.3` in the demo.
 
-This skill template uses the Xentara Utility Library, as well as the Xentara Plugin Framework. The corresponding documentation can be found here:
+## Build and load
 
-https://docs.xentara.io/xentara-utils/  
-https://docs.xentara.io/xentara-plugin/
+```sh
+cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo
+cmake --build build --parallel
+ctest --test-dir build --output-on-failure
+xentara --plugin build/reductstore-xentara.json --model examples/model.json
+```
 
-## Build Environment
+`build/reductstore-xentara.json` is the generated manifest. To install outside the build tree, use `cmake --install build --prefix "$HOME/.local"` and pass `--plugin-dir "$HOME/.local/share/xentara/plugins"`.
 
-The repository include a [CMakeLists.txt](CMakeLists.txt) file for use with [CMake](https://cmake.org/), which allows you to build the source code
-out of the box, as long as the Xentara development environment is installed. If you whish to use a different build system, you must generate the
-necessary build configuration file yourself.
+## Configuration
 
-## Source Code Documentation
+`@Skill.ReductStore.Client` owns an asynchronous uploader. Required fields are `serverUrl` and `bucket`. `apiToken` is optional only for servers configured for anonymous access.
 
-The source code in this repository is documented using [Doxygen](https://doxygen.nl/) comments. If you have Doxygen installed, you can
-generate detailed documentation for all classes, functions etc., including a TODO list. To generate the documentation using CMake, just
-build the target *docs* by executing the following command in your [build directory](https://cmake.org/cmake/help/latest/manual/cmake.1.html#generate-a-project-buildsystem):
+| Field | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `serverUrl` | string | required | `http://` or `https://` ReductStore URL |
+| `apiToken` | string | empty | ReductStore API token |
+| `bucket` | string | required | Destination bucket |
+| `host` | string | empty | `host` record label |
+| `connectionTimeout` | duration | `2s` | Connection timeout |
+| `requestTimeout` | duration | `10s` | Request timeout |
+| `createBucket` | Boolean | `false` | Create the destination bucket if missing |
+| `maxBatchRecords` | integer | `256` | Small-record batch limit |
+| `maxBatchPayloadBytes` | integer | `4194304` | Small-record batch payload limit |
+| `maxBatchAge` | duration | `2s` | Maximum age before flush |
+| `maxQueueBytes` | integer | `16777216` | In-memory payload queue budget |
+| `overflowPolicy` | string | `rejectNewest` | `rejectNewest` or `dropOldest` |
+| `retry.maxAttempts` | integer | `3` | Bounded attempts per send cycle |
+| `retry.initialBackoff` | duration | `100ms` | Initial retry delay |
+| `retry.maximumBackoff` | duration | `2s` | Maximum retry delay |
 
-~~~sh
-cmake --build . --target docs
-~~~
+`@Skill.ReductStore.Writer.records` maps a `dataPoint` to an `entry`. Each record supports static `labels` and `timestampSource`: `scheduled`, `sourceTime`, or `updateTime`.
 
-This will generate HTML documentation in the subdirectory *docs/html*.
+The writer adds `source`, `quality`, and configured `host` labels. It serializes Boolean, signed integer, unsigned integer, and floating-point values as compact JSON scalar payloads with `application/json`. Xentara 2.1.1 exposes numeric values and `Image` through public read handles. The skill intentionally does not claim native arbitrary binary or array ingestion. Its generic file streaming transport is independently tested and available for future source adapters that can provide a bounded stream.
 
-## Xentara Skill Element Templates
+## Timestamp and delivery policy
 
-*(See [Skill Elements](https://docs.xentara.io/xentara/xentara_skills.html#xentara_skill_elements) in the [Xentara documentation](https://docs.xentara.io/xentara/))*
+`scheduled` uses the pipeline scheduled time. `sourceTime` and `updateTime` preserve the Xentara time-point precision and suppress repeated timestamps per mapping. Use `updateTime` when unchanged values must not produce duplicate ReductStore records.
 
-### Client Template
+The collection task only reads, serializes, and enqueues. A worker thread performs all network I/O. It flushes on 256 records, 4 MiB, or two seconds by default using multi-entry `IBucket::WriteBatch()`. File payloads above the batch threshold use `IBucket::Write()` with the SDK callback and bounded chunks. The total file length is determined before upload.
 
-[src/TemplateClient.hpp](src/TemplateClient.hpp)  
-[src/TemplateClient.cpp](src/TemplateClient.cpp)
+The queue records rejected and dropped records through the writer status attributes and `sendError` event. `rejectNewest` preserves already queued data. `dropOldest` exposes its losses through the same counter. Process crashes lose the in-memory queue. The worker retains failed batches for later retries; if a full queue prevents retention, it reports an explicit failure. ReductStore records are immutable. A transport failure after the server accepts data is ambiguous: the skill never marks it delivered without an SDK success response, so an operator may need to resolve a duplicate-timestamp conflict before retrying.
 
-The client skill element template provides template code for services that do not require a persistent connection to the service instance.
-Such services are either entirely stateless, or require a single initialization and deinitialization call. This includes web services
-that use the HTTP or HTTPs protocols, for example.
+## Local demo
 
-### Transaction Template
+```sh
+docker compose -f examples/compose.yaml up -d
+cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo
+cmake --build build --parallel
+xentara --plugin build/reductstore-xentara.json --model examples/model.json
+```
 
-[src/TemplateTransaction.hpp](src/TemplateTransaction.hpp)  
-[src/TemplateTransaction.cpp](src/TemplateTransaction.cpp)
+The example copies only the required Signal Generator configuration and writes Pulse, Sine, Triangle, Saw-Tooth, Inverted Saw-Tooth, and Noise to `xentara-demo/signals/*` entries. ReductStore is bound only to `127.0.0.1:8383`; `xentara-demo-token` is demo-only.
 
-The transaction skill element template provides template code for transactions that accumulate data over a period of time, and only send it to the service instance
-at greater intervals.
+Inspect entries with:
 
-The template code has the following features:
+```sh
+curl -H 'Authorization: Bearer xentara-demo-token' http://127.0.0.1:8383/api/v1/b/xentara-demo
+curl -H 'Authorization: Bearer xentara-demo-token' 'http://127.0.0.1:8383/api/v1/b/xentara-demo/a/signals/sine'
+```
 
-- The skill element publishes a [Xentara task](https://docs.xentara.io/xentara/xentara_element_members.html#xentara_tasks) called *collect*,
-  which collect a set of records and buffers it for future sending.
-- The skill element publishes a [Xentara task](https://docs.xentara.io/xentara/xentara_element_members.html#xentara_tasks) called *send*,
-  which sends the collected records to the service instance.
-- The *send* task can be executed at greater intervals than the *collect* task, to collect multiple sets of records and send them to the
-  service instance using a single transaction
-- The skill element publishes [Xentara events](https://docs.xentara.io/xentara/xentara_element_members.html#xentara_events) to signal when
-  a transaction was sent, or if a send error occurred.
+Stop and remove demo data with:
+
+```sh
+docker compose -f examples/compose.yaml down -v
+```
+
+## Validation limitation
+
+The supplied runtime loads `libreductstore-xentara.so` from the generated manifest, then refuses to start the model because its licence does not include the new `ReductStore` skill. The installed general Xentara licence is insufficient: Xentara reports `could not find a valid Xentara licence for skill "ReductStore"`. Direct SDK integration tests against the local server pass, but the six-signal Xentara execution and readback remain blocked until embedded ocean issues a licence entitlement for this skill UUID.
+
+## Integration tests
+
+Start the demo service, configure with `-DREDUCTSTORE_XENTARA_ENABLE_INTEGRATION_TESTS=ON`, then run:
+
+```sh
+ctest --test-dir build --output-on-failure
+tests/integration-recovery.sh
+```
+
+The integration suite verifies multi-entry batch writes, stored scalar payload metadata, a generated 20 MiB file through the chunked `Write()` callback, duplicate timestamp errors, unavailable-server reporting, and recovery after the compose service restarts.
+
+## License
+
+Project code is licensed under the Boost Software License 1.0. `LICENSE` contains the original template license notice. ReductStore C++ SDK and Xentara have their own licenses.

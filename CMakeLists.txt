@@ -1,96 +1,53 @@
 cmake_minimum_required(VERSION 3.25)
 
-# TODO: rename project and add description, URL etc.
-project(xentara-template-uplink LANGUAGES CXX)
+project(reductstore-xentara VERSION 0.1.0 LANGUAGES CXX)
 
-# Force the use of C++ 20
+include(CTest)
+include(FetchContent)
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED YES)
+set(CMAKE_CXX_EXTENSIONS NO)
 
-# Tell MSVC to set __cplusplus to the correct value
-if(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
-	add_compile_options("/Zc:__cplusplus")
-endif()
+find_package(XentaraUtils 2.1.1 REQUIRED)
+find_package(XentaraPlugin 2.1.1 REQUIRED)
 
-# Find the Xentara utility and plugin libraries
-find_package(XentaraUtils REQUIRED)
-find_package(XentaraPlugin REQUIRED)
-
-# Add the plugin library target
-add_library(
-	${PROJECT_NAME} MODULE
-
-	"src/Attributes.cpp"
-	"src/Attributes.hpp"
-	"src/CustomError.cpp"
-	"src/CustomError.hpp"
-	"src/Events.cpp"
-	"src/Events.hpp"
-	"src/Skill.cpp"
-	"src/Skill.hpp"
-	"src/Tasks.cpp"
-	"src/Tasks.hpp"
-	"src/TemplateClient.cpp"
-	"src/TemplateClient.hpp"
-	"src/TemplateRecord.cpp"
-	"src/TemplateRecord.hpp"
-	"src/TemplateTransaction.cpp"
-	"src/TemplateTransaction.hpp"
+set(REDUCT_CPP_USE_FETCHCONTENT ON CACHE BOOL "" FORCE)
+FetchContent_Declare(
+	reductcpp
+	GIT_REPOSITORY https://github.com/reductstore/reduct-cpp.git
+	GIT_TAG 6bddc6ac7d428f8c9313967ca87865b2a243ab02
+	GIT_SHALLOW TRUE
 )
+FetchContent_MakeAvailable(reductcpp)
 
-# Link against the Xentara utility and plugin libraries
-target_link_libraries(
-	${PROJECT_NAME}
-
-	PRIVATE
-		Xentara::xentara-utils
-		Xentara::xentara-plugin
+add_library(reductstore-xentara-core STATIC
+	src/core/Batching.cpp
+	src/core/Configuration.cpp
+	src/core/Serialization.cpp
+	src/core/Transmission.cpp
 )
+target_include_directories(reductstore-xentara-core PUBLIC include)
+target_link_libraries(reductstore-xentara-core PUBLIC reductcpp::reductcpp)
+target_compile_features(reductstore-xentara-core PUBLIC cxx_std_20)
+set_target_properties(reductstore-xentara-core PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
-# Make output names adhere to Xentara convetions under Windows
-if(CMAKE_SYSTEM_NAME STREQUAL "Windows")
-	set_target_properties(
-		${PROJECT_NAME}
-		
-		PROPERTIES
-# TODO: adjust output name to match project name
-			OUTPUT_NAME XentaraTemplateUplink
-			DEBUG_POSTFIX d
-	)
-endif()
+add_library(reductstore-xentara MODULE
+	src/plugin/Plugin.cpp
+)
+target_link_libraries(reductstore-xentara PRIVATE reductstore-xentara-core Xentara::xentara-utils Xentara::xentara-plugin)
+target_compile_features(reductstore-xentara PRIVATE cxx_std_20)
+set_target_properties(reductstore-xentara PROPERTIES PREFIX "lib")
+install_xentara_plugin(reductstore-xentara NAME "ReductStore")
 
-# Generate the plugin manifest and add the plugin files to the install target
-install_xentara_plugin(${PROJECT_NAME})
-
-# Try to find Doxygen
-find_package(Doxygen QUIET)
-
-# Generate Doxygen documentation, if Doxygen was found
-if(Doxygen_FOUND)
-	# Get the list of source files from the library
-	get_target_property(target_sources ${PROJECT_NAME} SOURCES)
-
-	# Set some useful Doxygen options
-	set(DOXYGEN_QUIET YES)
-	set(DOXYGEN_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/docs")
-	set(DOXYGEN_EXTRACT_PRIVATE YES)
-	set(DOXYGEN_GENERATE_TREEVIEW YES)
-	set(DOXYGEN_EXTRACT_ANON_NSPACES YES)
-	set(DOXYGEN_SUBGROUPING NO)
-	set(DOXYGEN_WARN_IF_UNDOCUMENTED NO)
-
-	# Under Windows, Doxygen generates file names that are too long for it to handle, resulting in
-	# errors when generating the documentation. As a workaround, we tell Doxygen to generate short file names.
-	if(CMAKE_HOST_SYSTEM_NAME STREQUAL "Windows")
-		set(DOXYGEN_SHORT_NAMES YES)
+if(BUILD_TESTING)
+	add_executable(reductstore-xentara-core-tests tests/CoreTests.cpp)
+	target_link_libraries(reductstore-xentara-core-tests PRIVATE reductstore-xentara-core)
+	add_test(NAME reductstore-xentara-core-tests COMMAND reductstore-xentara-core-tests)
+	option(REDUCTSTORE_XENTARA_ENABLE_INTEGRATION_TESTS "Enable tests requiring a local ReductStore server" OFF)
+	if(REDUCTSTORE_XENTARA_ENABLE_INTEGRATION_TESTS)
+		add_executable(reductstore-xentara-integration-tests tests/IntegrationTests.cpp)
+		target_link_libraries(reductstore-xentara-integration-tests PRIVATE reductstore-xentara-core)
+		add_test(NAME reductstore-xentara-integration-tests COMMAND reductstore-xentara-integration-tests)
 	endif()
-
-	# Add the tag files for the Xentara documentation
-	set(DOXYGEN_TAGFILES
-		"${XentaraUtils_DOXYGEN_TAG_FILE}=https://docs.xentara.io/xentara-utils"
-		"${XentaraPlugin_DOXYGEN_TAG_FILE}=https://docs.xentara.io/xentara-plugin"
-	)
-
-	# Add a target to generate the Doxygen documentation
-	doxygen_add_docs(docs ${target_sources})
 endif()

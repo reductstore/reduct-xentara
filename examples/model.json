@@ -1,0 +1,96 @@
+{
+  "$schema": "https://docs.xentara.io/xentara/schema-xentara-model.json",
+  "children": [
+    {
+      "@Group": {
+        "name": "Signals",
+        "UUID": "c65685e6-b7a2-40b6-bce4-b84d2c538aeb",
+        "children": [
+          { "@DataPoint": { "name": "Pulse", "UUID": "db74bcdf-e5fc-4995-8712-f0817316ef80", "io": "Sampler.Pulse" } },
+          { "@DataPoint": { "name": "Sine Wave", "UUID": "f0ccedac-b2ad-408e-b5e5-9928286398aa", "io": "Sampler.Sine Wave" } },
+          { "@DataPoint": { "name": "Triangle", "UUID": "2bc1193e-f3aa-4d27-825a-e2df80368b66", "io": "Sampler.Triangle" } },
+          { "@DataPoint": { "name": "Saw-Tooth", "UUID": "b135131e-295a-4337-a1a3-cff5398cc882", "io": "Sampler.Saw-Tooth" } },
+          { "@DataPoint": { "name": "Inverted Saw-Tooth", "UUID": "61e4a832-e567-449a-b698-6b8be438217f", "io": "Sampler.Inverted Saw-Tooth" } },
+          { "@DataPoint": { "name": "Noise", "UUID": "8277834b-2b96-43c7-bfac-dc1b2b765e47", "io": "Sampler.Noise" } }
+        ]
+      }
+    },
+    {
+      "@Track": {
+        "name": "Sampler Track",
+        "UUID": "01a46e28-6202-40ce-b573-9919c60f4e95",
+        "children": [
+          { "@Timer": { "name": "Timer", "UUID": "f7b5fb56-7453-49c4-a32c-e7ec8b7079ee", "period": "500ms" } },
+          {
+            "@Pipeline": {
+              "name": "Pipeline",
+              "UUID": "01772ee7-563c-4391-b799-4053ef5ab0a9",
+              "triggers": [ "Sampler Track.Timer.expired" ],
+              "checkpoints": [ {}, {} ],
+              "segments": [
+                {
+                  "start": 0,
+                  "end": 1,
+                  "tasks": [
+                    { "function": "Sampler.generate" },
+                    { "function": "ReductStore.Writer.collect" },
+                    { "function": "ReductStore.Writer.send" }
+                  ]
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "@Skill.SignalGenerator.Sampler": {
+        "name": "Sampler",
+        "UUID": "80e21f72-d9b1-4e1d-b281-7c2937391c67",
+        "children": [
+          { "@Skill.SignalGenerator.Signal": { "name": "Pulse", "UUID": "8e58ff02-90ff-4d55-9b48-b5db73d83314", "dataType": "bool", "top": 1, "bottom": 0, "waveForm": { "@Pulse": { "period": "5s", "phaseOffset": "0", "pulseWidth": "2s" } } } },
+          { "@Skill.SignalGenerator.Signal": { "name": "Sine Wave", "UUID": "c8e84dc2-5f91-4a84-8a3b-8d397f964e21", "dataType": "float64", "top": 100, "bottom": 50, "waveForm": { "@SineWave": { "period": "15s", "phaseOffset": "1s" } } } },
+          { "@Skill.SignalGenerator.Signal": { "name": "Triangle", "UUID": "85ec0c7b-1922-4f47-a059-ec046ecf4ba1", "dataType": "float32", "top": 10, "bottom": -10, "waveForm": { "@Triangle": { "period": "5s", "phaseOffset": "0" } } } },
+          { "@Skill.SignalGenerator.Signal": { "name": "Saw-Tooth", "UUID": "ebd0adb1-ef43-4fc9-85fc-56ffebbcb93b", "dataType": "int64", "top": 3000, "bottom": -1000, "waveForm": { "@SawTooth": { "period": "5s", "phaseOffset": "0" } } } },
+          { "@Skill.SignalGenerator.Signal": { "name": "Inverted Saw-Tooth", "UUID": "8449698d-f1e6-4108-9195-98ad75ed1181", "dataType": "uint16", "top": 0, "bottom": 300, "waveForm": { "@SawTooth": { "period": "5s", "phaseOffset": "3s" } } } },
+          { "@Skill.SignalGenerator.Signal": { "name": "Noise", "UUID": "4102ea81-95c3-4e3f-bee4-ecf7b208420a", "dataType": "int16", "top": 10000, "bottom": 0, "waveForm": { "@Noise": {} } } }
+        ]
+      }
+    },
+    {
+      "@Skill.ReductStore.Client": {
+        "name": "ReductStore",
+        "UUID": "a0b078a6-5ca6-4064-a0d8-8c9889a5bc5d",
+        "serverUrl": "http://127.0.0.1:8383",
+        "apiToken": "xentara-demo-token",
+        "bucket": "xentara-demo",
+        "host": "xentara-demo",
+        "createBucket": true,
+        "connectionTimeout": "2s",
+        "requestTimeout": "10s",
+        "maxBatchRecords": 256,
+        "maxBatchPayloadBytes": 4194304,
+        "maxBatchAge": "2s",
+        "maxQueueBytes": 16777216,
+        "overflowPolicy": "rejectNewest",
+        "retry": { "maxAttempts": 3, "initialBackoff": "100ms", "maximumBackoff": "2s" },
+        "children": [
+          {
+            "@Skill.ReductStore.Writer": {
+              "name": "Writer",
+              "UUID": "8aaec43f-6419-4af2-a6be-31b1ac9c92ea",
+              "records": [
+                { "dataPoint": "Signals.Pulse", "entry": "signals/pulse", "timestampSource": "scheduled" },
+                { "dataPoint": "Signals.Sine Wave", "entry": "signals/sine", "timestampSource": "scheduled" },
+                { "dataPoint": "Signals.Triangle", "entry": "signals/triangle", "timestampSource": "scheduled" },
+                { "dataPoint": "Signals.Saw-Tooth", "entry": "signals/saw-tooth", "timestampSource": "scheduled" },
+                { "dataPoint": "Signals.Inverted Saw-Tooth", "entry": "signals/inverted-saw-tooth", "timestampSource": "scheduled" },
+                { "dataPoint": "Signals.Noise", "entry": "signals/noise", "timestampSource": "scheduled" }
+              ]
+            }
+          }
+        ]
+      }
+    }
+  ]
+}
