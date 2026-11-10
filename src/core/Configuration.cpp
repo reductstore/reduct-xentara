@@ -13,9 +13,13 @@ auto validate(const ClientConfiguration& configuration) -> std::string
 	{
 		return "bucket must not be empty";
 	}
-	if (configuration.connectionTimeout.count() <= 0 || configuration.requestTimeout.count() <= 0)
+	if (configuration.connectionTimeout.count() <= 0 || configuration.requestTimeout.count() <= 0 || configuration.shutdownTimeout.count() <= 0)
 	{
 		return "timeouts must be positive";
+	}
+	if (configuration.shutdownTimeout < configuration.requestTimeout)
+	{
+		return "shutdownTimeout must be at least requestTimeout";
 	}
 	if (configuration.maxBatchRecords == 0 || configuration.maxBatchPayloadBytes == 0 ||
 		configuration.maxBatchMetadataBytes == 0 || configuration.maxBatchAge.count() <= 0)

@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <functional>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -42,6 +43,11 @@ void rejectsInvalidConfiguration()
 	config.maxBatchRecords = 64;
 	config.maxBatchMetadataBytes = 0;
 	check(!validate(config).empty(), "a zero batch metadata limit must be rejected");
+
+	config.maxBatchMetadataBytes = 6U * 1024U;
+	config.shutdownTimeout = std::chrono::milliseconds(1);
+	config.requestTimeout = std::chrono::milliseconds(2);
+	check(!validate(config).empty(), "a shutdown timeout shorter than a request must be rejected");
 }
 
 void namespacesEntriesWithoutMandatoryPrefix()
@@ -56,6 +62,13 @@ void serializesNumericMeasurements()
 	check(serializeScalar(std::uintmax_t(42)) == "42", "unsigned integers must retain their value");
 	check(serializeScalar(3.25) == "3.25", "floating point values must be JSON numbers");
 	check(serializeScalar(true) == "true", "booleans must be JSON booleans");
+}
+
+void rejectsNonFiniteMeasurementsWithoutSerialization()
+{
+	check(!trySerializeScalar(std::numeric_limits<double>::quiet_NaN()), "NaN must be rejected before JSON serialization");
+	check(!trySerializeScalar(std::numeric_limits<double>::infinity()), "infinity must be rejected before JSON serialization");
+	check(trySerializeScalar(3.25) == "3.25", "finite floating-point values must remain JSON numbers");
 }
 
 void serializesScheduledSnapshot()
@@ -157,11 +170,12 @@ void accountsForMetadataAndInflightRecords()
 void preservesPartialBatchRecordIdentity()
 {
 	const auto timestamp = TimePoint(std::chrono::nanoseconds(123));
-	const auto partial = UploadResult::partial({ { "entry-a", timestamp } });
+	const auto partial = UploadResult::partial({ { { "entry-a", timestamp }, 409, "already exists" } });
 	check(!partial.delivered, "partial write errors must not be marked as delivered");
-	check(partial.failedRecords.size() == 1, "partial failures must retain record identities");
-	check(partial.failedRecords.front().entry == "entry-a", "partial failures must retain the failed entry");
-	check(partial.failedRecords.front().timestamp == timestamp, "partial failures must retain the failed timestamp");
+	check(partial.recordFailures.size() == 1, "partial failures must retain record identities");
+	check(partial.recordFailures.front().identity.entry == "entry-a", "partial failures must retain the failed entry");
+	check(partial.recordFailures.front().identity.timestamp == timestamp, "partial failures must retain the failed timestamp");
+	check(partial.recordFailures.front().code == 409, "partial failures must retain the ReductStore error code");
 }
 
 void retriesTransientFailures()
@@ -170,7 +184,7 @@ void retriesTransientFailures()
 	std::size_t attempts = 0;
 	const auto result = retryTransient(retry, [&attempts] {
 		++attempts;
-		return attempts == 3 ? UploadResult::success() : UploadResult::transportFailure("unavailable");
+		return attempts == 3 ? UploadResult::success() : UploadResult::transportFailure(-1, "unavailable");
 	});
 	check(result.delivered, "a retry succeeding within the bound must be delivered");
 	check(attempts == 3, "transient failures must use the configured retry bound");
@@ -182,7 +196,7 @@ void doesNotRetryPermanentFailures()
 	std::size_t attempts = 0;
 	const auto result = retryTransient(retry, [&attempts] {
 		++attempts;
-		return UploadResult { false, false, "forbidden", {} };
+		return UploadResult { false, false, 403, "forbidden", {} };
 	});
 	check(!result.delivered, "a permanent failure must remain undelivered");
 	check(attempts == 1, "a permanent failure must not be retried");
@@ -196,6 +210,17 @@ void rejectsOverflowWithoutDiscardingQueuedRecords()
 	check(!queue.push(Record { "b", {}, "application/json", "1", {} }), "a full queue must reject the new record");
 	check(queue.size() == 1, "overflow must preserve queued records");
 	check(queue.rejectedRecords() == 1, "queue loss must be observable");
+}
+
+void dropsOldestRecordWhenConfigured()
+{
+	const Record first { "a", {}, "application/json", "1234", {} };
+	BoundedQueue queue(first.storageBytes(), OverflowPolicy::DropOldest);
+	check(queue.push(first), "the first record must fit");
+	check(queue.push(Record { "b", {}, "application/json", "1234", {} }), "drop-oldest overflow must accept the replacement record");
+	const auto record = queue.tryPop();
+	check(record && record->entry == "b", "drop-oldest overflow must retain the newest record");
+	check(queue.droppedRecords() == 1, "dropped records must be observable");
 }
 
 void retriesTransientFailuresAndPreservesPartialFailures()
@@ -230,6 +255,7 @@ int main()
 		{ "rejects invalid configuration", rejectsInvalidConfiguration },
 		{ "namespaces optional entry prefixes", namespacesEntriesWithoutMandatoryPrefix },
 		{ "serializes numeric measurements", serializesNumericMeasurements },
+		{ "rejects non-finite measurements", rejectsNonFiniteMeasurementsWithoutSerialization },
 		{ "serializes scheduled snapshots", serializesScheduledSnapshot },
 		{ "serializes snapshot quality", serializesSnapshotQuality },
 		{ "serializes snapshot source time", serializesSnapshotSourceTime },
@@ -238,6 +264,7 @@ int main()
 		{ "flushes at metadata boundary", flushesAtMetadataBoundary },
 		{ "accounts for metadata and in-flight records", accountsForMetadataAndInflightRecords },
 		{ "rejects queue overflow", rejectsOverflowWithoutDiscardingQueuedRecords },
+		{ "drops oldest queue overflow", dropsOldestRecordWhenConfigured },
 		{ "retries transient failures", retriesTransientFailuresAndPreservesPartialFailures },
 		{ "does not retry permanent failures", doesNotRetryPermanentFailures },
 		{ "releases pending records on shutdown", releasesPendingRecordsOnShutdown },

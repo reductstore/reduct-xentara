@@ -28,6 +28,7 @@ struct ClientConfiguration
 	std::string bucket;
 	std::chrono::milliseconds connectionTimeout { 2000 };
 	std::chrono::milliseconds requestTimeout { 10000 };
+	std::chrono::milliseconds shutdownTimeout { 10000 };
 	bool createBucket { false };
 	std::size_t maxBatchRecords { 64 };
 	std::size_t maxBatchPayloadBytes { 4U * 1024U * 1024U };

@@ -74,6 +74,11 @@ auto BatchPlanner::empty() const noexcept -> bool
 	return _records.empty();
 }
 
+auto BatchPlanner::size() const noexcept -> std::size_t
+{
+	return _records.size();
+}
+
 BoundedQueue::BoundedQueue(std::size_t maxPayloadBytes, OverflowPolicy policy) :
 	_maxPayloadBytes(maxPayloadBytes),
 	_policy(policy)
@@ -188,17 +193,17 @@ auto BoundedQueue::storageBytes(const Record& record) -> std::size_t
 
 auto UploadResult::success() -> UploadResult
 {
-	return { true, false, {}, {} };
+	return { true, false, 0, {}, {} };
 }
 
-auto UploadResult::transportFailure(std::string error) -> UploadResult
+auto UploadResult::transportFailure(int errorCode, std::string error) -> UploadResult
 {
-	return { false, true, std::move(error), {} };
+	return { false, true, errorCode, std::move(error), {} };
 }
 
-auto UploadResult::partial(std::vector<RecordIdentity> failedRecords) -> UploadResult
+auto UploadResult::partial(std::vector<RecordFailure> recordFailures) -> UploadResult
 {
-	return { false, false, "partial batch failure", std::move(failedRecords) };
+	return { false, false, 0, "partial batch failure", std::move(recordFailures) };
 }
 
 

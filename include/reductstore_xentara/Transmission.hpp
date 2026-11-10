@@ -4,6 +4,8 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdint>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -17,11 +19,14 @@ struct DeliveryStatus
 {
 	bool connected { false };
 	std::size_t deliveredRecords { 0 };
+	std::map<std::uint64_t, std::size_t> deliveredRecordsByProducer;
 	std::size_t failedRecords { 0 };
 	std::size_t queuedRecords { 0 };
+	std::size_t inFlightRecords { 0 };
 	std::size_t queuedBytes { 0 };
 	TimePoint lastSuccessfulSendTime { TimePoint::min() };
 	std::string error;
+	int lastErrorCode { 0 };
 };
 
 class ReductTransport final
@@ -58,11 +63,12 @@ public:
 
 private:
 	auto run() -> void;
-	auto setFailure(std::string error) -> void;
+	auto setFailure(int code, std::string error) -> void;
 
 	ClientConfiguration _configuration;
 	BoundedQueue _queue;
 	std::atomic<bool> _running { false };
+	std::atomic<std::size_t> _inFlightRecords { 0 };
 	std::thread _thread;
 	mutable std::mutex _statusMutex;
 	DeliveryStatus _status;

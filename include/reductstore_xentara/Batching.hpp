@@ -32,7 +32,7 @@ struct Record
 	std::string contentType;
 	std::string payload;
 	Labels labels;
-
+	std::uint64_t producerId { 0 };
 	[[nodiscard]] auto storageBytes() const noexcept -> std::size_t;
 	[[nodiscard]] auto metadataBytes() const noexcept -> std::size_t;
 };
@@ -43,6 +43,13 @@ struct RecordIdentity
 	TimePoint timestamp;
 
 	auto operator==(const RecordIdentity&) const -> bool = default;
+};
+
+struct RecordFailure
+{
+	RecordIdentity identity;
+	int code;
+	std::string message;
 };
 
 struct BatchLimits
@@ -61,7 +68,7 @@ public:
 	[[nodiscard]] auto shouldFlush(std::chrono::steady_clock::time_point now) const -> bool;
 	[[nodiscard]] auto take() -> std::vector<Record>;
 	[[nodiscard]] auto empty() const noexcept -> bool;
-
+	[[nodiscard]] auto size() const noexcept -> std::size_t;
 private:
 	BatchLimits _limits;
 	std::vector<Record> _records;
@@ -102,12 +109,13 @@ struct UploadResult
 {
 	bool delivered { false };
 	bool retryable { false };
+	int errorCode { 0 };
 	std::string error;
-	std::vector<RecordIdentity> failedRecords;
+	std::vector<RecordFailure> recordFailures;
 
 	[[nodiscard]] static auto success() -> UploadResult;
-	[[nodiscard]] static auto transportFailure(std::string error) -> UploadResult;
-	[[nodiscard]] static auto partial(std::vector<RecordIdentity> failedRecords) -> UploadResult;
+	[[nodiscard]] static auto transportFailure(int errorCode, std::string error) -> UploadResult;
+	[[nodiscard]] static auto partial(std::vector<RecordFailure> recordFailures) -> UploadResult;
 };
 
 template <typename Upload>

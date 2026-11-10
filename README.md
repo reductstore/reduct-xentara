@@ -26,10 +26,10 @@ The generated manifest loads the plugin from the build directory. To install it 
 | `apiToken` | empty | ReductStore API token |
 | `entryPrefix` | empty | Optional relative prefix for every entry |
 | `host` | `auto` | Automatic hostname or explicit `host` label |
-| `connectionTimeout` / `requestTimeout` | `2s` / `10s` | HTTP timeouts |
+| `connectionTimeout` / `requestTimeout` / `shutdownTimeout` | `2s` / `10s` / `10s` | HTTP connect, request, and final-flush bounds |
 | `createBucket` | `false` | Create a missing bucket |
 | `maxBatchRecords` / `maxBatchPayloadBytes` / `maxBatchMetadataBytes` | `64` / `4194304` / `6144` | Batch limits |
-| `maxBatchAge` / `maxQueueBytes` | `2s` / `16777216` | Flush age and bounded queue budget |
+| `maxBatchAge` / `maxQueueBytes` | `2s` / `16777216` | Flush age and bounded memory budget |
 | `overflowPolicy` | `rejectNewest` | `rejectNewest` or `dropOldest` |
 | `retry` | `3`, `100ms`, `2s` | Attempts, initial backoff, maximum backoff |
 
@@ -39,13 +39,15 @@ The generated manifest loads the plugin from the build directory. To install it 
 {"measurements":{"temperature":42.5,"pressure":1.03},"sourceTime":{"temperature":1794000000000000},"quality":{"temperature":"Good","pressure":"Good"}}
 ```
 
-The record timestamp is the scheduled pipeline time. `sourceTime` is optional and contains Unix microseconds only for measurements whose Xentara data point supplies it. The writer adds `host`, stores standard Xentara quality per field, and writes the worst quality as the record `quality` label. It accepts Boolean, signed integer, unsigned integer, and floating-point values. An unreadable value produces no partial snapshot. `collectionFailures` and `duplicateSnapshots` are exposed as attributes.
+The record timestamp is the scheduled pipeline time. `sourceTime` is optional and contains Unix microseconds only for measurements whose Xentara data point supplies it. The writer adds `host`, stores standard Xentara quality per field, and writes the worst quality as the record `quality` label. It accepts Boolean, signed integer, unsigned integer, and floating-point values. An unreadable or non-finite value produces no partial snapshot. `collectionFailures` and `duplicateSnapshots` are exposed as attributes.
 
 ## Delivery
 
-Snapshot record timestamps are normalized to ReductStore microseconds before duplicate detection and delivery. Record identity is `entry + timestamp`. Per-measurement Xentara source times remain in the optional JSON `sourceTime` object.
+Snapshot record timestamps are normalized to ReductStore microseconds before duplicate detection and delivery. Record identity is `entry + timestamp`. Every snapshot either contains all configured values and qualities or is skipped. Source times are read after values and are best effort, so they are optional rather than a point-in-time atomic read. 
 
-Collection only reads, serializes, and enqueues. A worker performs HTTP I/O, batching up to 64 records, 4 MiB payload, 6 KiB metadata, or two seconds. Queue limits include queued and in-flight records. Transient failures use bounded exponential backoff. Permanent failures retain affected records and stop delivery until cleanup. Process crashes and cleanup after a bounded final flush can lose in-memory records; failures and overflow are exposed through writer attributes and events.
+Collection only reads, serializes, and enqueues. A worker performs HTTP I/O, batching up to 64 records, 4 MiB payload, 6 KiB metadata, or two seconds. `queuedRecords` counts records awaiting pickup; `inFlightRecords` counts records in the batch planner or current request; `queuedBytes` reserves memory for both. These queue metrics and failure totals are shared by writers under one client. `sent` events are attributed to the writer that produced the confirmed record.
+
+The worker preserves SDK error codes. It retries only transport failures, 408, 429, and 5xx responses. In a partial batch result, confirmed records are released, transient per-record errors retry, and permanent per-record errors are released and counted without blocking later uploads. A retry that later reports an immutable-record conflict is never counted as delivered; inspect `failedRecords` and the error event for the retained HTTP status. Shutdown allows final requests only while the remaining `shutdownTimeout` can accommodate `requestTimeout`. Process crashes, overflow, and final-flush expiry can lose in-memory records and are exposed through attributes and events.
 
 The public Xentara adapter supports scalar values only. Binary and image source contracts are tracked separately.
 
@@ -66,8 +68,7 @@ curl -H 'Authorization: Bearer xentara-demo-token' 'http://127.0.0.1:8383/api/v1
 docker compose -f examples/compose.yaml down -v
 ```
 
-## Tests and limitation
-Enable integration tests with `-DREDUCTSTORE_XENTARA_ENABLE_INTEGRATION_TESTS=ON`, then run `ctest --test-dir build --output-on-failure` and `tests/integration-recovery.sh`. They cover multi-entry batches, payload metadata, immutable timestamp conflicts, unavailable-server handling, and recovery.
+Enable integration tests with `-DREDUCTSTORE_XENTARA_ENABLE_INTEGRATION_TESTS=ON`, then run `ctest --test-dir build --output-on-failure` and `tests/integration-recovery.sh`. They cover multi-entry batches, snapshot metadata, immutable timestamp conflicts, per-record partial failures, unavailable-server retry, recovery of a queued record across a real server restart, and bounded shutdown.
 
 The installed runtime loads the plugin but rejects the model because its signed licence lacks the `ReductStore` skill entitlement. Direct SDK integration tests pass; six-signal Xentara execution remains blocked until embedded ocean issues that entitlement.
 

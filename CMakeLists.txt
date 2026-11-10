@@ -17,7 +17,6 @@ FetchContent_Declare(
 	reductcpp
 	GIT_REPOSITORY https://github.com/reductstore/reduct-cpp.git
 	GIT_TAG 6bddc6ac7d428f8c9313967ca87865b2a243ab02
-	GIT_SHALLOW TRUE
 )
 FetchContent_MakeAvailable(reductcpp)
 

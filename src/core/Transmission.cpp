@@ -13,10 +13,16 @@ namespace reductstore_xentara
 
 namespace
 {
-
-auto retryable(const reduct::Error& error) -> bool
+class TransportException final : public std::runtime_error
 {
-	return error.code == -1 || error.code == 408 || error.code == 429 || error.code >= 500;
+public:
+	TransportException(int code, std::string message) : std::runtime_error(std::move(message)), code(code) {}
+	int code;
+};
+
+auto retryable(int code) -> bool
+{
+	return code == -1 || code == 408 || code == 429 || code >= 500;
 }
 
 auto message(const reduct::Error& error) -> std::string
@@ -46,7 +52,7 @@ public:
 			_client = reduct::IClient::Build(configuration.serverUrl, options);
 			if (!_client)
 			{
-				throw std::runtime_error("could not create ReductStore client");
+				throw TransportException(-1, "could not create ReductStore client");
 			}
 		}
 		if (!_bucket)
@@ -54,7 +60,7 @@ public:
 			auto result = configuration.createBucket ? _client->GetOrCreateBucket(configuration.bucket) : _client->GetBucket(configuration.bucket);
 			if (result.error)
 			{
-				throw std::runtime_error(message(result.error));
+				throw TransportException(result.error.code, message(result.error));
 			}
 			_bucket = std::move(result.result);
 		}
@@ -87,25 +93,29 @@ auto ReductTransport::writeBatch(const std::vector<Record>& records) -> UploadRe
 		});
 		if (result.error)
 		{
-			return { false, retryable(result.error), message(result.error), {} };
+			return { false, retryable(result.error.code), result.error.code, message(result.error), {} };
 		}
 		if (!result.result.empty())
 		{
-			std::vector<RecordIdentity> failedRecords;
+			std::vector<RecordFailure> failures;
 			for (const auto& [entry, errors] : result.result)
 			{
 				for (const auto& [timestamp, error] : errors)
 				{
-					failedRecords.push_back({ entry, timestamp });
+					failures.push_back({ { entry, timestamp }, error.code, message(error) });
 				}
 			}
-			return UploadResult::partial(std::move(failedRecords));
+			return UploadResult::partial(std::move(failures));
 		}
 		return UploadResult::success();
 	}
+	catch (const TransportException& error)
+	{
+		return { false, retryable(error.code), error.code, error.what(), {} };
+	}
 	catch (const std::exception& error)
 	{
-		return UploadResult::transportFailure(error.what());
+		return UploadResult::transportFailure(-1, error.what());
 	}
 }
 
@@ -154,6 +164,7 @@ auto UplinkWorker::status() const -> DeliveryStatus
 	std::lock_guard lock(_statusMutex);
 	auto status = _status;
 	status.queuedRecords = _queue.size();
+	status.inFlightRecords = _inFlightRecords.load();
 	status.queuedBytes = _queue.residentBytes();
 	return status;
 }
@@ -168,10 +179,11 @@ auto UplinkWorker::droppedRecords() const -> std::size_t
 	return _queue.droppedRecords();
 }
 
-auto UplinkWorker::setFailure(std::string error) -> void
+auto UplinkWorker::setFailure(int code, std::string error) -> void
 {
 	std::lock_guard lock(_statusMutex);
 	_status.connected = false;
+	_status.lastErrorCode = code;
 	_status.error = std::move(error);
 }
 
@@ -203,13 +215,14 @@ auto UplinkWorker::run() -> void
 			_queue.release(*record);
 			++undelivered;
 		}
+		_inFlightRecords = 0;
 		return undelivered;
 	};
 	while (_running || !planner.empty() || _queue.size() != 0 || !pending.empty())
 	{
 		if (!_running && !shutdownDeadline)
 		{
-			shutdownDeadline = std::chrono::steady_clock::now() + _configuration.requestTimeout;
+			shutdownDeadline = std::chrono::steady_clock::now() + _configuration.shutdownTimeout;
 		}
 		if (shutdownDeadline && std::chrono::steady_clock::now() >= *shutdownDeadline)
 		{
@@ -218,7 +231,7 @@ auto UplinkWorker::run() -> void
 				std::lock_guard lock(_statusMutex);
 				_status.failedRecords = undelivered;
 			}
-			setFailure("shutdown final flush timed out with undelivered records");
+			setFailure(-1, "shutdown final flush timed out with undelivered records");
 			return;
 		}
 		if (pending.empty())
@@ -226,6 +239,7 @@ auto UplinkWorker::run() -> void
 			if (auto record = _queue.waitPop(std::chrono::milliseconds(50)))
 			{
 				planner.push(std::move(*record), std::chrono::steady_clock::now());
+				_inFlightRecords = planner.size();
 			}
 			if (planner.empty())
 			{
@@ -236,8 +250,29 @@ auto UplinkWorker::run() -> void
 				continue;
 			}
 			pending = planner.take();
+			_inFlightRecords = pending.size();
 		}
-		auto result = retryTransient(_configuration.retry, [&transport, &pending] { return transport.writeBatch(pending); });
+		UploadResult result;
+		for (std::size_t attempt = 0; attempt < _configuration.retry.maxAttempts; ++attempt)
+		{
+			if (shutdownDeadline && std::chrono::steady_clock::now() + _configuration.requestTimeout > *shutdownDeadline)
+			{
+				result = UploadResult::transportFailure(-1, "shutdown final flush timed out before another HTTP request");
+				break;
+			}
+			result = transport.writeBatch(pending);
+			if (result.delivered || !result.retryable || attempt + 1 == _configuration.retry.maxAttempts || !_running)
+			{
+				break;
+			}
+			const auto multiplier = std::int64_t { 1 } << attempt;
+			const auto delay = std::min(_configuration.retry.maximumBackoff, _configuration.retry.initialBackoff * multiplier);
+			const auto retryAt = std::chrono::steady_clock::now() + delay;
+			while (_running && std::chrono::steady_clock::now() < retryAt)
+			{
+				std::this_thread::sleep_for(std::chrono::milliseconds(10));
+			}
+		}
 		if (result.delivered)
 		{
 			for (const auto& record : pending)
@@ -247,49 +282,73 @@ auto UplinkWorker::run() -> void
 			std::lock_guard lock(_statusMutex);
 			_status.connected = true;
 			_status.error.clear();
+			_status.lastErrorCode = 0;
+			for (const auto& record : pending)
+			{
+				++_status.deliveredRecordsByProducer[record.producerId];
+			}
 			_status.deliveredRecords += pending.size();
-			_status.failedRecords = 0;
 			_status.lastSuccessfulSendTime = TimePoint::clock::now();
 			pending.clear();
+			_inFlightRecords = 0;
 			continue;
 		}
-		if (!result.failedRecords.empty())
+		if (!result.recordFailures.empty())
 		{
-			std::vector<Record> failed;
-			failed.reserve(result.failedRecords.size());
+			std::vector<Record> retry;
 			for (auto& record : pending)
 			{
-				const RecordIdentity identity { record.entry, record.timestamp };
-				if (std::ranges::find(result.failedRecords, identity) != result.failedRecords.end())
-				{
-					failed.push_back(std::move(record));
-				}
-				else
+				const RecordIdentity identity { record.entry, normalizeTimestamp(record.timestamp) };
+				const auto failure = std::ranges::find_if(result.recordFailures,
+					[&identity](const RecordFailure& item) { return item.identity == identity; });
+				if (failure == result.recordFailures.end())
 				{
 					_queue.release(record);
+					std::lock_guard lock(_statusMutex);
+					++_status.deliveredRecords;
+					++_status.deliveredRecordsByProducer[record.producerId];
+					_status.lastSuccessfulSendTime = TimePoint::clock::now();
+					continue;
 				}
+				if (retryable(failure->code))
+				{
+					retry.push_back(std::move(record));
+					continue;
+				}
+				_queue.release(record);
+				std::lock_guard lock(_statusMutex);
+				++_status.failedRecords;
+				_status.lastErrorCode = failure->code;
+				_status.error = failure->message;
 			}
-			pending = std::move(failed);
-		}
-		{
-			std::lock_guard lock(_statusMutex);
-			_status.failedRecords = pending.size();
-		}
-		setFailure(result.error);
-		if (!result.retryable && !pending.empty())
-		{
-			while (_running)
+			pending = std::move(retry);
+			_inFlightRecords = pending.size();
+			if (pending.empty())
 			{
-				std::this_thread::sleep_for(std::chrono::milliseconds(50));
+				continue;
 			}
-			const auto undelivered = releaseUndelivered();
+		}
+		if (!result.retryable)
+		{
+			for (const auto& record : pending)
+			{
+				_queue.release(record);
+			}
 			{
 				std::lock_guard lock(_statusMutex);
-				_status.failedRecords = undelivered;
+				_status.failedRecords += pending.size();
 			}
-			return;
+			pending.clear();
+			_inFlightRecords = 0;
+			setFailure(result.errorCode, result.error);
+			continue;
 		}
-		std::this_thread::sleep_for(_configuration.retry.maximumBackoff);
+		setFailure(result.errorCode, result.error);
+		const auto retryAt = std::chrono::steady_clock::now() + _configuration.retry.maximumBackoff;
+		while (_running && std::chrono::steady_clock::now() < retryAt)
+		{
+			std::this_thread::sleep_for(std::chrono::milliseconds(10));
+		}
 	}
 }
 

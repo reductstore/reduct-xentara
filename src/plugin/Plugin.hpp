@@ -14,9 +14,12 @@
 #include <xentara/skill/Skill.hpp>
 #include <xentara/utils/core/Uuid.hpp>
 
+#include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <vector>
@@ -67,6 +70,7 @@ private:
 	{
 		bool healthy { false };
 		std::uint64_t queuedRecords { 0 };
+		std::uint64_t inFlightRecords { 0 };
 		std::uint64_t queuedBytes { 0 };
 		std::uint64_t rejectedRecords { 0 };
 		std::uint64_t droppedRecords { 0 };
@@ -134,12 +138,14 @@ private:
 	auto updateState(std::chrono::system_clock::time_point timestamp) -> void;
 
 	std::reference_wrapper<ReductClient> _client;
+	std::uint64_t _producerId { 0 };
 	std::vector<Snapshot> _snapshots;
 	process::Event _sent;
 	process::Event _error;
 	CollectTask _collectTask;
 	SendTask _sendTask;
 	memory::ObjectBlock<State> _state;
+	std::mutex _mutex;
 	std::size_t _observedDelivered { 0 };
 	std::size_t _collectionFailures { 0 };
 	std::size_t _observedCollectionFailures { 0 };

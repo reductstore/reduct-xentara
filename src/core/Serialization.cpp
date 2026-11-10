@@ -87,6 +87,15 @@ auto serializeScalar(double value) -> std::string
 	return asJsonNumber(value);
 }
 
+auto trySerializeScalar(double value) -> std::optional<std::string>
+{
+	if (!std::isfinite(value))
+	{
+		return std::nullopt;
+	}
+	return asJsonNumber(value);
+}
+
 auto serializeString(std::string_view value) -> std::string
 {
 	std::string result;

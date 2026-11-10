@@ -34,8 +34,11 @@ namespace
 using namespace std::literals;
 using namespace xentara::literals;
 
+std::atomic_uint64_t nextProducerId { 1 };
+
 const model::Attribute kHealthy { "98915e48-f6d9-4954-9d33-e91ffca468f9"_uuid, "healthy"sv, model::Attribute::Access::ReadOnly, data::DataType::kBoolean };
 const model::Attribute kQueuedRecords { "fe3d61a2-8720-4ce7-948a-bf22ad5dbb1f"_uuid, "queuedRecords"sv, model::Attribute::Access::ReadOnly, data::DataType::kInteger };
+const model::Attribute kInFlightRecords { "d6c7c05a-9a7e-48b2-9aa8-faf9a339dbb1"_uuid, "inFlightRecords"sv, model::Attribute::Access::ReadOnly, data::DataType::kInteger };
 const model::Attribute kQueuedBytes { "b6350cac-b1ae-44a4-b5ef-5b4d2fb5c2d5"_uuid, "queuedBytes"sv, model::Attribute::Access::ReadOnly, data::DataType::kInteger };
 const model::Attribute kRejectedRecords { "a065417d-5e59-4db7-9707-7d03e1f9af17"_uuid, "rejectedRecords"sv, model::Attribute::Access::ReadOnly, data::DataType::kInteger };
 const model::Attribute kDroppedRecords { "a55ee685-69e2-4e9d-b889-64c64eeb6024"_uuid, "droppedRecords"sv, model::Attribute::Access::ReadOnly, data::DataType::kInteger };
@@ -131,6 +134,7 @@ auto ReductClient::load(utils::json::decoder::Object& object, config::Context&) 
 		else if (name == "host"sv) _host = value.asString<std::string>();
 		else if (name == "connectionTimeout"sv) _configuration.connectionTimeout = value.toTimeDuration<std::chrono::milliseconds>();
 		else if (name == "requestTimeout"sv) _configuration.requestTimeout = value.toTimeDuration<std::chrono::milliseconds>();
+		else if (name == "shutdownTimeout"sv) _configuration.shutdownTimeout = value.toTimeDuration<std::chrono::milliseconds>();
 		else if (name == "createBucket"sv) _configuration.createBucket = value.asBoolean();
 		else if (name == "maxBatchRecords"sv) _configuration.maxBatchRecords = value.asNumber<std::size_t>();
 		else if (name == "maxBatchPayloadBytes"sv) _configuration.maxBatchPayloadBytes = value.asNumber<std::size_t>();
@@ -180,6 +184,7 @@ auto ReductClient::cleanup() -> void
 
 ReductWriter::ReductWriter(std::reference_wrapper<ReductClient> client) :
 	_client(client),
+	_producerId(nextProducerId.fetch_add(1)),
 	_collectTask(*this),
 	_sendTask(*this)
 {
@@ -187,7 +192,7 @@ ReductWriter::ReductWriter(std::reference_wrapper<ReductClient> client) :
 
 auto ReductWriter::forEachAttribute(const model::ForEachAttributeFunction& function) const -> bool
 {
-	return function(kHealthy) || function(kQueuedRecords) || function(kQueuedBytes) || function(kRejectedRecords) ||
+	return function(kHealthy) || function(kQueuedRecords) || function(kInFlightRecords) || function(kQueuedBytes) || function(kRejectedRecords) ||
 		function(kDroppedRecords) || function(kFailedRecords) || function(kCollectionFailures) ||
 		function(kDuplicateSnapshots) || function(kLastSuccessfulSendTime) || function(kError);
 }
@@ -206,6 +211,7 @@ auto ReductWriter::makeReadHandle(const model::Attribute& attribute) const noexc
 {
 	if (attribute == kHealthy) return _state.member(&State::healthy);
 	if (attribute == kQueuedRecords) return _state.member(&State::queuedRecords);
+	if (attribute == kInFlightRecords) return _state.member(&State::inFlightRecords);
 	if (attribute == kQueuedBytes) return _state.member(&State::queuedBytes);
 	if (attribute == kRejectedRecords) return _state.member(&State::rejectedRecords);
 	if (attribute == kDroppedRecords) return _state.member(&State::droppedRecords);
@@ -255,7 +261,7 @@ auto ReductWriter::Measurement::valuePayload() const -> std::optional<std::strin
 	case data::NativeType::Boolean: { auto item = value.read<bool>(); if (item) return reductstore_xentara::serializeScalar(*item); break; }
 	case data::NativeType::Integer: { auto item = value.read<std::intmax_t>(); if (item) return reductstore_xentara::serializeScalar(*item); break; }
 	case data::NativeType::UnsignedInteger: { auto item = value.read<std::uintmax_t>(); if (item) return reductstore_xentara::serializeScalar(*item); break; }
-	case data::NativeType::FloatingPoint: { auto item = value.read<double>(); if (item) return reductstore_xentara::serializeScalar(*item); break; }
+	case data::NativeType::FloatingPoint: { auto item = value.read<double>(); if (item) return reductstore_xentara::trySerializeScalar(*item); break; }
 	default: break;
 	}
 	return std::nullopt;
@@ -403,20 +409,31 @@ auto ReductWriter::prepare() -> void
 
 auto ReductWriter::collect(const process::ExecutionContext& context) -> void
 {
-	for (auto& snapshot : _snapshots)
 	{
-		auto result = snapshot.collect(context.scheduledTime(), _client.get().host(), _client.get().entryPrefix());
-		if (result.status == Snapshot::CollectionStatus::Incomplete)
+		std::lock_guard lock(_mutex);
+		for (auto& snapshot : _snapshots)
 		{
-			++_collectionFailures;
-			continue;
+			try
+			{
+				auto result = snapshot.collect(context.scheduledTime(), _client.get().host(), _client.get().entryPrefix());
+				if (result.status == Snapshot::CollectionStatus::Incomplete)
+				{
+					++_collectionFailures;
+					continue;
+				}
+				if (result.status == Snapshot::CollectionStatus::Duplicate)
+				{
+					++_duplicateSnapshots;
+					continue;
+				}
+				result.record->producerId = _producerId;
+				(void)_client.get().worker().enqueue(std::move(*result.record));
+			}
+			catch (const std::exception&)
+			{
+				++_collectionFailures;
+			}
 		}
-		if (result.status == Snapshot::CollectionStatus::Duplicate)
-		{
-			++_duplicateSnapshots;
-			continue;
-		}
-		(void)_client.get().worker().enqueue(std::move(*result.record));
 	}
 	updateState(context.scheduledTime());
 }
@@ -424,12 +441,16 @@ auto ReductWriter::collect(const process::ExecutionContext& context) -> void
 
 auto ReductWriter::updateState(std::chrono::system_clock::time_point timestamp) -> void
 {
+	std::lock_guard lock(_mutex);
 	const auto status = _client.get().worker().status();
+	const auto delivered = status.deliveredRecordsByProducer.find(_producerId);
+	const auto deliveredRecords = delivered == status.deliveredRecordsByProducer.end() ? 0 : delivered->second;
 	const auto collectionFailed = _collectionFailures != _observedCollectionFailures;
 	memory::WriteSentinel sentinel { _state };
 	auto& state = *sentinel;
 	state.healthy = status.connected && status.error.empty() && !collectionFailed;
 	state.queuedRecords = status.queuedRecords;
+	state.inFlightRecords = status.inFlightRecords;
 	state.queuedBytes = status.queuedBytes;
 	state.rejectedRecords = _client.get().worker().rejectedRecords();
 	state.droppedRecords = _client.get().worker().droppedRecords();
@@ -443,9 +464,9 @@ auto ReductWriter::updateState(std::chrono::system_clock::time_point timestamp) 
 		_observedCollectionFailures = _collectionFailures;
 		sentinel.commit(timestamp, _error);
 	}
-	else if (status.deliveredRecords > _observedDelivered)
+	else if (deliveredRecords > _observedDelivered)
 	{
-		_observedDelivered = status.deliveredRecords;
+		_observedDelivered = deliveredRecords;
 		sentinel.commit(timestamp, _sent);
 	}
 	else if (!status.error.empty())

@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <stdexcept>
+#include <thread>
 #include <string>
 #include <vector>
 
@@ -32,6 +33,20 @@ auto environment(const char* name, const char* fallback) -> std::string
 	return fallback;
 }
 
+
+auto waitFor(auto condition, std::chrono::milliseconds timeout) -> bool
+{
+	const auto deadline = std::chrono::steady_clock::now() + timeout;
+	while (std::chrono::steady_clock::now() < deadline)
+	{
+		if (condition())
+		{
+			return true;
+		}
+		std::this_thread::sleep_for(std::chrono::milliseconds(10));
+	}
+	return condition();
+}
 auto configuration() -> ClientConfiguration
 {
 	ClientConfiguration config;
@@ -110,6 +125,34 @@ void writesAndReadsProductionSnapshot()
 	check(labels.at("quality") == "Acceptable", "snapshot quality label must match");
 }
 
+void workerCompletesSuccessfulRecordsFromPartialBatch()
+{
+	auto config = configuration();
+	config.maxBatchRecords = 2;
+	config.maxBatchAge = std::chrono::milliseconds(10);
+	config.retry.maxAttempts = 1;
+	config.retry.maximumBackoff = std::chrono::milliseconds(10);
+	const auto timestamp = TimePoint::clock::now();
+	ReductTransport transport(config);
+	const Record duplicate { "partial/duplicate", timestamp, "application/json", "1", {} };
+	check(transport.writeBatch({ duplicate }).delivered, "partial failure fixture must create a record");
+
+	UplinkWorker worker(config);
+	worker.start();
+	check(worker.enqueue(duplicate), "duplicate record must enter the worker queue");
+	check(worker.enqueue(Record { "partial/success", timestamp, "application/json", "2", {} }), "successful record must enter the worker queue");
+	check(waitFor([&worker] {
+		const auto status = worker.status();
+		return status.deliveredRecords == 1 && status.failedRecords == 1;
+	}, std::chrono::seconds(2)), "a partial failure must deliver unaffected records");
+	check(worker.status().lastErrorCode == 409, "the partial failure HTTP status must be retained");
+
+	check(worker.enqueue(Record { "partial/after", timestamp, "application/json", "3", {} }), "subsequent record must enter the worker queue");
+	check(waitFor([&worker] { return worker.status().deliveredRecords == 2; }, std::chrono::seconds(2)),
+		"a permanent per-record failure must not block later uploads");
+	worker.stop();
+}
+
 
 void detectsDuplicateTimestamp()
 {
@@ -130,16 +173,63 @@ void reportsUnavailableServer()
 	check(!result.delivered && result.retryable, "an unavailable server must be retryable and undelivered");
 }
 
+void workerStopsWithinShutdownTimeout()
+{
+	auto config = configuration();
+	config.serverUrl = "http://127.0.0.1:8384";
+	config.connectionTimeout = std::chrono::milliseconds(50);
+	config.requestTimeout = std::chrono::milliseconds(100);
+	config.shutdownTimeout = std::chrono::milliseconds(100);
+	config.maxBatchRecords = 1;
+	config.maxBatchAge = std::chrono::milliseconds(1);
+	config.retry.maximumBackoff = std::chrono::seconds(1);
+	UplinkWorker worker(config);
+	worker.start();
+	check(worker.enqueue(Record { "shutdown/value", TimePoint::clock::now(), "application/json", "1", {} }),
+		"shutdown record must enter the queue");
+	check(waitFor([&worker] { return !worker.status().error.empty(); }, std::chrono::seconds(2)),
+		"worker must attempt the unavailable server");
+	const auto started = std::chrono::steady_clock::now();
+	worker.stop();
+	check(std::chrono::steady_clock::now() - started < std::chrono::milliseconds(250),
+		"worker shutdown must not wait for a retry backoff");
+}
+
+void workerRecoversQueuedRecordAfterServerRestart()
+{
+	auto config = configuration();
+	config.maxBatchRecords = 1;
+	config.maxBatchAge = std::chrono::milliseconds(1);
+	config.retry.maximumBackoff = std::chrono::milliseconds(100);
+	config.shutdownTimeout = std::chrono::seconds(2);
+	UplinkWorker worker(config);
+	worker.start();
+	check(worker.enqueue(Record { "recovery/value", TimePoint::clock::now(), "application/json", "1", {} }),
+		"recovery record must enter the queue");
+	check(waitFor([&worker] { return !worker.status().error.empty(); }, std::chrono::seconds(3)),
+		"worker must report the initial outage");
+	check(waitFor([&worker] { return worker.status().deliveredRecords == 1; }, std::chrono::seconds(15)),
+		"worker must deliver the queued record after server recovery");
+	worker.stop();
+}
+
 }
 
 int main()
 {
 	try
 	{
+		if (std::getenv("REDUCTSTORE_RECOVERY_TEST"))
+		{
+			workerRecoversQueuedRecordAfterServerRestart();
+			return 0;
+		}
 		writesAndReadsMultipleEntries();
 		writesAndReadsProductionSnapshot();
 		detectsDuplicateTimestamp();
 		reportsUnavailableServer();
+		workerStopsWithinShutdownTimeout();
+		workerCompletesSuccessfulRecordsFromPartialBatch();
 	}
 	catch (const std::exception& error)
 	{
