@@ -5,7 +5,6 @@
 
 #include <algorithm>
 #include <chrono>
-#include <sstream>
 #include <stdexcept>
 #include <utility>
 
@@ -110,31 +109,6 @@ auto ReductTransport::writeBatch(const std::vector<Record>& records) -> UploadRe
 	}
 }
 
-auto ReductTransport::writeFile(const Record& metadata, const FilePayload& payload) -> UploadResult
-{
-	try
-	{
-		reduct::IBucket::WriteOptions options {};
-		options.timestamp = metadata.timestamp;
-		options.labels = metadata.labels;
-		options.content_type = metadata.contentType;
-		const auto error = _implementation->bucket()->Write(metadata.entry, options, [&payload](reduct::IBucket::WritableRecord* record) {
-			record->Write(payload.size(), [&payload](std::size_t offset, std::size_t bytes) {
-				auto chunk = payload.read(offset, bytes);
-				return std::pair { true, std::move(chunk) };
-			});
-		});
-		if (error)
-		{
-			return { false, retryable(error), message(error), {} };
-		}
-		return UploadResult::success();
-	}
-	catch (const std::exception& error)
-	{
-		return UploadResult::transportFailure(error.what());
-	}
-}
 
 UplinkWorker::UplinkWorker(ClientConfiguration configuration) :
 	_configuration(std::move(configuration)),

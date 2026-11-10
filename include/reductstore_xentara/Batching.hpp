@@ -7,7 +7,6 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
-#include <filesystem>
 #include <functional>
 #include <map>
 #include <mutex>
@@ -131,16 +130,5 @@ auto retryTransient(const RetryPolicy& policy, Upload&& upload) -> UploadResult
 	return result;
 }
 
-class FilePayload final
-{
-public:
-	explicit FilePayload(std::filesystem::path path);
-	[[nodiscard]] auto size() const noexcept -> std::size_t;
-	[[nodiscard]] auto read(std::size_t offset, std::size_t maximumBytes) const -> std::string;
-
-private:
-	std::filesystem::path _path;
-	std::size_t _size;
-};
 
 }

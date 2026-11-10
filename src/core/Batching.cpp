@@ -1,7 +1,6 @@
 #include "reductstore_xentara/Batching.hpp"
 
 #include <algorithm>
-#include <fstream>
 #include <stdexcept>
 #include <thread>
 #include <utility>
@@ -197,34 +196,5 @@ auto UploadResult::partial(std::vector<RecordIdentity> failedRecords) -> UploadR
 	return { false, false, "partial batch failure", std::move(failedRecords) };
 }
 
-FilePayload::FilePayload(std::filesystem::path path) :
-	_path(std::move(path)),
-	_size(std::filesystem::file_size(_path))
-{
-}
-
-auto FilePayload::size() const noexcept -> std::size_t
-{
-	return _size;
-}
-
-auto FilePayload::read(std::size_t offset, std::size_t maximumBytes) const -> std::string
-{
-	if (offset >= _size)
-	{
-		return {};
-	}
-	const auto bytes = std::min(maximumBytes, _size - offset);
-	std::ifstream file(_path, std::ios::binary);
-	if (!file)
-	{
-		throw std::runtime_error("could not open streaming payload");
-	}
-	file.seekg(static_cast<std::streamoff>(offset));
-	std::string chunk(bytes, '\0');
-	file.read(chunk.data(), static_cast<std::streamsize>(chunk.size()));
-	chunk.resize(static_cast<std::size_t>(file.gcount()));
-	return chunk;
-}
 
 }

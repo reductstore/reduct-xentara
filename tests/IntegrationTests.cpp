@@ -5,8 +5,6 @@
 
 #include <chrono>
 #include <cstdlib>
-#include <filesystem>
-#include <fstream>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -111,24 +109,6 @@ void writesAndReadsProductionSnapshot()
 	check(labels.at("quality") == "Acceptable", "snapshot quality label must match");
 }
 
-void streamsTwentyMiBFile()
-{
-	const auto file = std::filesystem::temp_directory_path() / "reductstore-xentara-integration.bin";
-	{
-		std::ofstream output(file, std::ios::binary);
-		std::string chunk(1024U * 1024U, 'z');
-		for (int index = 0; index < 20; ++index)
-		{
-			output.write(chunk.data(), static_cast<std::streamsize>(chunk.size()));
-		}
-	}
-	FilePayload payload(file);
-	ReductTransport transport(configuration());
-	const auto timestamp = TimePoint::clock::now();
-	const Record metadata { "binary/large", timestamp, "application/octet-stream", {}, { { "source", "integration" } } };
-	check(transport.writeFile(metadata, payload).delivered, "chunked twenty MiB write must succeed");
-	std::filesystem::remove(file);
-}
 
 void detectsDuplicateTimestamp()
 {
@@ -157,7 +137,6 @@ int main()
 	{
 		writesAndReadsMultipleEntries();
 		writesAndReadsProductionSnapshot();
-		streamsTwentyMiBFile();
 		detectsDuplicateTimestamp();
 		reportsUnavailableServer();
 	}

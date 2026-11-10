@@ -35,7 +35,6 @@ public:
 	auto operator=(const ReductTransport&) -> ReductTransport& = delete;
 
 	[[nodiscard]] auto writeBatch(const std::vector<Record>& records) -> UploadResult;
-	[[nodiscard]] auto writeFile(const Record& metadata, const FilePayload& payload) -> UploadResult;
 
 private:
 	class Implementation;

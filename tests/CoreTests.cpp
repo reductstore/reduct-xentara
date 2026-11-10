@@ -5,8 +5,6 @@
 
 #include <chrono>
 #include <cstdint>
-#include <filesystem>
-#include <fstream>
 #include <functional>
 #include <iostream>
 #include <stdexcept>
@@ -192,30 +190,6 @@ void retriesTransientFailuresAndPreservesPartialFailures()
 	preservesPartialBatchRecordIdentity();
 }
 
-void streamsFilesInBoundedChunks()
-{
-	const auto file = std::filesystem::temp_directory_path() / "reductstore-xentara-streaming-test.bin";
-	{
-		std::ofstream stream(file, std::ios::binary);
-		std::string chunk(1024 * 1024, 'x');
-		for (int index = 0; index < 20; ++index)
-		{
-			stream.write(chunk.data(), static_cast<std::streamsize>(chunk.size()));
-		}
-	}
-
-	FilePayload payload(file);
-	check(payload.size() == 20U * 1024U * 1024U, "the stream source must know the total length");
-	std::size_t observed = 0;
-	for (std::size_t offset = 0; offset < payload.size(); offset += 65536)
-	{
-		const auto chunk = payload.read(offset, 65536);
-		check(chunk.size() <= 65536, "streaming reads must stay bounded");
-		observed += chunk.size();
-	}
-	check(observed == payload.size(), "streaming reads must cover the complete file");
-	std::filesystem::remove(file);
-}
 
 void releasesPendingRecordsOnShutdown()
 {
@@ -252,7 +226,6 @@ int main()
 		{ "retries transient failures", retriesTransientFailuresAndPreservesPartialFailures },
 		{ "does not retry permanent failures", doesNotRetryPermanentFailures },
 		{ "releases pending records on shutdown", releasesPendingRecordsOnShutdown },
-		{ "streams files in bounded chunks", streamsFilesInBoundedChunks },
 	};
 
 	for (const auto& [name, test] : tests)

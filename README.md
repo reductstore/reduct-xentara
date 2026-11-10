@@ -49,7 +49,7 @@ All timestamps are normalized to ReductStore microseconds before duplicate detec
 
 Collection only reads, serializes, and enqueues. A worker performs HTTP I/O, batching up to 64 records, 4 MiB payload, 6 KiB metadata, or two seconds. Queue limits include queued and in-flight records. Transient failures use bounded exponential backoff. Permanent failures retain affected records and stop delivery until cleanup. Process crashes and cleanup after a bounded final flush can lose in-memory records; failures and overflow are exposed through writer attributes and events.
 
-`FilePayload` uses `IBucket::Write()` with bounded callback chunks and a known content length. It is integration-tested, but no public Xentara data-point adapter currently provides arbitrary binary or image ingestion.
+The public Xentara adapter supports scalar values only. Binary and image source contracts are tracked separately.
 
 ## Local demo
 
@@ -69,8 +69,7 @@ docker compose -f examples/compose.yaml down -v
 ```
 
 ## Tests and limitation
-
-Enable integration tests with `-DREDUCTSTORE_XENTARA_ENABLE_INTEGRATION_TESTS=ON`, then run `ctest --test-dir build --output-on-failure` and `tests/integration-recovery.sh`. They cover multi-entry batches, payload metadata, 20 MiB chunked file upload, duplicate timestamps, unavailable-server handling, and recovery.
+Enable integration tests with `-DREDUCTSTORE_XENTARA_ENABLE_INTEGRATION_TESTS=ON`, then run `ctest --test-dir build --output-on-failure` and `tests/integration-recovery.sh`. They cover multi-entry batches, payload metadata, immutable timestamp conflicts, unavailable-server handling, and recovery.
 
 The installed runtime loads the plugin but rejects the model because its signed licence lacks the `ReductStore` skill entitlement. Direct SDK integration tests pass; six-signal Xentara execution remains blocked until embedded ocean issues that entitlement.
 
