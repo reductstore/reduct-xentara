@@ -229,7 +229,7 @@ auto UplinkWorker::run() -> void
 			const auto undelivered = releaseUndelivered();
 			{
 				std::lock_guard lock(_statusMutex);
-				_status.failedRecords = undelivered;
+				_status.failedRecords += undelivered;
 			}
 			setFailure(-1, "shutdown final flush timed out with undelivered records");
 			return;
