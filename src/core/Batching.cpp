@@ -13,6 +13,11 @@ auto normalizeTimestamp(TimePoint timestamp) -> TimePoint
 	return std::chrono::time_point_cast<std::chrono::microseconds>(timestamp);
 }
 
+auto unixMicroseconds(TimePoint timestamp) -> std::int64_t
+{
+	return std::chrono::duration_cast<std::chrono::microseconds>(timestamp.time_since_epoch()).count();
+}
+
 auto Record::storageBytes() const noexcept -> std::size_t
 {
 	auto bytes = sizeof(Record) + entry.capacity() + contentType.capacity() + payload.capacity();

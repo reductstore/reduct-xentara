@@ -222,7 +222,7 @@ auto ReductWriter::category() const noexcept -> model::ElementCategory
 	return model::ElementCategory::Transaction;
 }
 
-auto ReductWriter::Mapping::resolve() -> void
+auto ReductWriter::Measurement::resolve() -> void
 {
 	auto point = dataPoint.lock();
 	if (!point)
@@ -231,13 +231,11 @@ auto ReductWriter::Mapping::resolve() -> void
 	}
 	value = point->attributeReadHandle(model::Attribute::kValue);
 	quality = point->attributeReadHandle(model::Attribute::kQuality);
-	if (timestampSource == TimestampSource::Source) timestamp = point->attributeReadHandle(model::Attribute::kSourceTime);
-	if (timestampSource == TimestampSource::Update) timestamp = point->attributeReadHandle(model::Attribute::kUpdateTime);
-	if (value.hardError() || quality.hardError() || (timestampSource != TimestampSource::Scheduled && timestamp.hardError()))
+	sourceTimestamp = point->attributeReadHandle(model::Attribute::kSourceTime);
+	if (value.hardError() || quality.hardError())
 	{
 		throw std::runtime_error("writer could not create required data point read handles");
 	}
-	source = std::string(point->primaryKey());
 	switch (value.nativeType())
 	{
 	case data::NativeType::Boolean:
@@ -250,7 +248,7 @@ auto ReductWriter::Mapping::resolve() -> void
 	}
 }
 
-auto ReductWriter::Mapping::valuePayload() const -> std::optional<std::string>
+auto ReductWriter::Measurement::valuePayload() const -> std::optional<std::string>
 {
 	switch (value.nativeType())
 	{
@@ -261,34 +259,6 @@ auto ReductWriter::Mapping::valuePayload() const -> std::optional<std::string>
 	default: break;
 	}
 	return std::nullopt;
-}
-
-auto ReductWriter::Mapping::collect(std::chrono::system_clock::time_point scheduledTime, const std::string& host, const std::string& entryPrefix) -> std::optional<reductstore_xentara::Record>
-{
-	auto recordTimestamp = reductstore_xentara::normalizeTimestamp(scheduledTime);
-	if (timestampSource != TimestampSource::Scheduled)
-	{
-		auto valueTimestamp = timestamp.read<std::chrono::system_clock::time_point>();
-		if (!valueTimestamp) return std::nullopt;
-		recordTimestamp = reductstore_xentara::normalizeTimestamp(*valueTimestamp);
-		if (lastTimestamp == recordTimestamp) return std::nullopt;
-	}
-	auto payload = valuePayload();
-	if (!payload) return std::nullopt;
-	auto qualityValue = quality.read<data::Quality>();
-	if (!qualityValue) return std::nullopt;
-	auto recordLabels = labels;
-	recordLabels["quality"] = data::toString(*qualityValue);
-	recordLabels["source"] = source;
-	recordLabels["host"] = host;
-	lastTimestamp = recordTimestamp;
-	return reductstore_xentara::Record {
-		reductstore_xentara::entryName(entryPrefix, entry),
-		recordTimestamp,
-		"application/json",
-		std::move(*payload),
-		std::move(recordLabels),
-	};
 }
 
 auto ReductWriter::Snapshot::resolve() -> void
@@ -304,8 +274,10 @@ auto ReductWriter::Snapshot::collect(std::chrono::system_clock::time_point sched
 		return { CollectionStatus::Duplicate, std::nullopt };
 	}
 	std::vector<std::pair<std::string, std::string>> values;
+	std::vector<std::pair<std::string, std::string>> sourceTimes;
 	std::vector<std::pair<std::string, std::string>> qualities;
 	values.reserve(measurements.size());
+	sourceTimes.reserve(measurements.size());
 	qualities.reserve(measurements.size());
 	std::optional<data::Quality> aggregateQuality;
 	for (const auto& measurement : measurements)
@@ -317,9 +289,25 @@ auto ReductWriter::Snapshot::collect(std::chrono::system_clock::time_point sched
 			return { CollectionStatus::Incomplete, std::nullopt };
 		}
 		values.emplace_back(measurement.name, std::move(*value));
+		if (!measurement.sourceTimestamp.hardError())
+		{
+			if (auto sourceTime = measurement.sourceTimestamp.read<std::chrono::system_clock::time_point>())
+			{
+				sourceTimes.emplace_back(measurement.name,
+					reductstore_xentara::serializeScalar(static_cast<std::intmax_t>(reductstore_xentara::unixMicroseconds(*sourceTime))));
+			}
+		}
 		qualities.emplace_back(measurement.name, reductstore_xentara::serializeString(data::toString(*quality)));
 		aggregateQuality = aggregateQuality ? data::combine(*aggregateQuality, *quality) : *quality;
 	}
+	std::vector<std::pair<std::string, std::string>> payload;
+	payload.reserve(3);
+	payload.emplace_back("measurements", reductstore_xentara::serializeObject(values));
+	if (!sourceTimes.empty())
+	{
+		payload.emplace_back("sourceTime", reductstore_xentara::serializeObject(sourceTimes));
+	}
+	payload.emplace_back("quality", reductstore_xentara::serializeObject(qualities));
 	auto recordLabels = labels;
 	recordLabels["host"] = host;
 	recordLabels["quality"] = data::toString(*aggregateQuality);
@@ -330,10 +318,7 @@ auto ReductWriter::Snapshot::collect(std::chrono::system_clock::time_point sched
 			reductstore_xentara::entryName(entryPrefix, entry),
 			recordTimestamp,
 			"application/json",
-			reductstore_xentara::serializeObject({
-				{ "measurements", reductstore_xentara::serializeObject(values) },
-				{ "quality", reductstore_xentara::serializeObject(qualities) },
-			}),
+			reductstore_xentara::serializeObject(payload),
 			std::move(recordLabels),
 		},
 	};
@@ -343,36 +328,7 @@ auto ReductWriter::load(utils::json::decoder::Object& object, config::Context& c
 {
 	for (auto&& [name, value] : object)
 	{
-		if (name == "records"sv)
-		{
-			for (auto&& item : value.asArray())
-			{
-				Mapping mapping;
-				bool dataPointLoaded = false;
-				bool entryLoaded = false;
-				for (auto&& [recordName, recordValue] : item.asObject())
-				{
-					if (recordName == "dataPoint"sv) { context.resolve<model::Element>(recordValue, std::ref(mapping.dataPoint)); dataPointLoaded = true; }
-					else if (recordName == "entry"sv) { mapping.entry = recordValue.asString<std::string>(); entryLoaded = isRelativeEntry(mapping.entry); }
-					else if (recordName == "timestampSource"sv)
-					{
-						const auto source = recordValue.asString<std::string>();
-						if (source == "scheduled") mapping.timestampSource = Mapping::TimestampSource::Scheduled;
-						else if (source == "sourceTime") mapping.timestampSource = Mapping::TimestampSource::Source;
-						else if (source == "updateTime") mapping.timestampSource = Mapping::TimestampSource::Update;
-						else throw std::runtime_error("timestampSource must be scheduled, sourceTime, or updateTime");
-					}
-					else if (recordName == "labels"sv)
-					{
-						for (auto&& [label, labelValue] : recordValue.asObject()) mapping.labels.emplace(std::string(label), labelValue.asString<std::string>());
-					}
-					else config::throwUnknownParameterError(recordName);
-				}
-				if (!dataPointLoaded || !entryLoaded) throw std::runtime_error("each writer record requires dataPoint and relative entry");
-				_mappings.push_back(std::move(mapping));
-			}
-		}
-		else if (name == "recordGroups"sv)
+		if (name == "recordGroups"sv)
 		{
 			for (auto&& item : value.asArray())
 			{
@@ -412,7 +368,7 @@ auto ReductWriter::load(utils::json::decoder::Object& object, config::Context& c
 						for (auto&& [measurementName, dataPoint] : groupValue.asObject())
 						{
 							if (measurementName.empty()) throw std::runtime_error("snapshot measurement names must be non-empty");
-							Mapping measurement;
+							Measurement measurement;
 							measurement.name = std::string(measurementName);
 							context.resolve<model::Element>(dataPoint, std::ref(measurement.dataPoint));
 							snapshot.measurements.push_back(std::move(measurement));
@@ -432,7 +388,7 @@ auto ReductWriter::load(utils::json::decoder::Object& object, config::Context& c
 			config::throwUnknownParameterError(name);
 		}
 	}
-	if (_mappings.empty() && _snapshots.empty()) throw std::runtime_error("writer requires at least one record or record group");
+	if (_snapshots.empty()) throw std::runtime_error("writer requires at least one record group");
 }
 
 auto ReductWriter::realize() -> void
@@ -442,19 +398,11 @@ auto ReductWriter::realize() -> void
 
 auto ReductWriter::prepare() -> void
 {
-	for (auto& mapping : _mappings) mapping.resolve();
 	for (auto& snapshot : _snapshots) snapshot.resolve();
 }
 
 auto ReductWriter::collect(const process::ExecutionContext& context) -> void
 {
-	for (auto& mapping : _mappings)
-	{
-		if (auto record = mapping.collect(context.scheduledTime(), _client.get().host(), _client.get().entryPrefix()))
-		{
-			(void)_client.get().worker().enqueue(std::move(*record));
-		}
-	}
 	for (auto& snapshot : _snapshots)
 	{
 		auto result = snapshot.collect(context.scheduledTime(), _client.get().host(), _client.get().entryPrefix());

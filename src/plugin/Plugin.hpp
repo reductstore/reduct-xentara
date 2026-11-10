@@ -77,23 +77,16 @@ private:
 		std::chrono::system_clock::time_point lastSuccessfulSendTime { std::chrono::system_clock::time_point::min() };
 	};
 
-	struct Mapping
+	struct Measurement
 	{
-		enum class TimestampSource { Scheduled, Source, Update };
 		std::weak_ptr<const model::Element> dataPoint;
-		std::string entry;
 		std::string name;
-		reductstore_xentara::Labels labels;
-		TimestampSource timestampSource { TimestampSource::Scheduled };
 		data::ReadHandle value;
 		data::ReadHandle quality;
-		data::ReadHandle timestamp;
-		std::optional<std::chrono::system_clock::time_point> lastTimestamp;
-		std::string source;
+		data::ReadHandle sourceTimestamp;
 
 		auto resolve() -> void;
 		[[nodiscard]] auto valuePayload() const -> std::optional<std::string>;
-		[[nodiscard]] auto collect(std::chrono::system_clock::time_point scheduledTime, const std::string& host, const std::string& entryPrefix) -> std::optional<reductstore_xentara::Record>;
 	};
 
 	struct Snapshot
@@ -107,7 +100,7 @@ private:
 
 		std::string entry;
 		reductstore_xentara::Labels labels;
-		std::vector<Mapping> measurements;
+		std::vector<Measurement> measurements;
 		std::optional<std::chrono::system_clock::time_point> lastTimestamp;
 
 		auto resolve() -> void;
@@ -141,7 +134,6 @@ private:
 	auto updateState(std::chrono::system_clock::time_point timestamp) -> void;
 
 	std::reference_wrapper<ReductClient> _client;
-	std::vector<Mapping> _mappings;
 	std::vector<Snapshot> _snapshots;
 	process::Event _sent;
 	process::Event _error;

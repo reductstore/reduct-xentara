@@ -83,6 +83,7 @@ void writesAndReadsProductionSnapshot()
 	const auto timestamp = TimePoint::clock::now();
 	const auto payload = serializeObject({
 		{ "measurements", serializeObject({ { "pulse", "true" }, { "sine", "74.3" } }) },
+		{ "sourceTime", serializeObject({ { "pulse", "1794000000000000" } }) },
 		{ "quality", serializeObject({ { "pulse", serializeString("Good") }, { "sine", serializeString("Acceptable") } }) },
 	});
 	ReductTransport transport(config);

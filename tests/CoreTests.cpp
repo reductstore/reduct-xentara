@@ -68,6 +68,20 @@ void serializesScheduledSnapshot()
 	check(serializeObject(fields) == "{\"pulse\":true,\"sine\":74.3,\"quoted\\\"field\":-2}", "a snapshot must serialize named JSON fields");
 }
 
+void serializesSnapshotSourceTime()
+{
+	const auto sourceTime = serializeObject({
+		{ "temperature", serializeScalar(unixMicroseconds(TimePoint(std::chrono::nanoseconds(1'794'000'000'000'123'789LL)))) },
+	});
+	const auto payload = serializeObject({
+		{ "measurements", serializeObject({ { "temperature", "42.5" }, { "pressure", "1.03" } }) },
+		{ "sourceTime", sourceTime },
+		{ "quality", serializeObject({ { "temperature", serializeString("Good") }, { "pressure", serializeString("Good") } }) },
+	});
+	check(payload == "{\"measurements\":{\"temperature\":42.5,\"pressure\":1.03},\"sourceTime\":{\"temperature\":1794000000000123},\"quality\":{\"temperature\":\"Good\",\"pressure\":\"Good\"}}",
+		"a snapshot must preserve available per-measurement source times as Unix microseconds");
+}
+
 void serializesSnapshotQuality()
 {
 	const auto measurements = serializeObject({
@@ -218,6 +232,7 @@ int main()
 		{ "serializes numeric measurements", serializesNumericMeasurements },
 		{ "serializes scheduled snapshots", serializesScheduledSnapshot },
 		{ "serializes snapshot quality", serializesSnapshotQuality },
+		{ "serializes snapshot source time", serializesSnapshotSourceTime },
 		{ "preserves timestamp precision", preservesTimestampPrecision },
 		{ "selects batch boundaries", selectsBatchBoundaries },
 		{ "flushes at metadata boundary", flushesAtMetadataBoundary },

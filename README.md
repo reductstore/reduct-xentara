@@ -33,19 +33,17 @@ The generated manifest loads the plugin from the build directory. To install it 
 | `overflowPolicy` | `rejectNewest` | `rejectNewest` or `dropOldest` |
 | `retry` | `3`, `100ms`, `2s` | Attempts, initial backoff, maximum backoff |
 
-`@Skill.ReductStore.Writer.records` maps one data point to one relative entry. Point records accept static `labels` and `timestampSource`: `scheduled`, `sourceTime`, or `updateTime`.
-
-A `recordGroups` snapshot requires `mode: "snapshot"`, an entry, `timestampSource: "scheduled"`, and a `measurements` map. It writes one `application/json` record:
+`@Skill.ReductStore.Writer` accepts `recordGroups`. This release supports `mode: "snapshot"` only. A snapshot requires an entry, `timestampSource: "scheduled"`, and a `measurements` map. It writes one `application/json` record:
 
 ```json
-{"measurements":{"temperature":42.5,"pressure":1.03},"quality":{"temperature":"Good","pressure":"Acceptable"}}
+{"measurements":{"temperature":42.5,"pressure":1.03},"sourceTime":{"temperature":1794000000000000},"quality":{"temperature":"Good","pressure":"Good"}}
 ```
 
-The writer adds `host`, stores standard Xentara quality per field, and writes the worst quality as the record `quality` label. It accepts Boolean, signed integer, unsigned integer, and floating-point values. An unreadable value produces no partial snapshot. `collectionFailures` and `duplicateSnapshots` are exposed as attributes.
+The record timestamp is the scheduled pipeline time. `sourceTime` is optional and contains Unix microseconds only for measurements whose Xentara data point supplies it. The writer adds `host`, stores standard Xentara quality per field, and writes the worst quality as the record `quality` label. It accepts Boolean, signed integer, unsigned integer, and floating-point values. An unreadable value produces no partial snapshot. `collectionFailures` and `duplicateSnapshots` are exposed as attributes.
 
 ## Delivery
 
-All timestamps are normalized to ReductStore microseconds before duplicate detection and delivery. Record identity is `entry + timestamp`; use `updateTime` when an unchanged source timestamp should not be written again.
+Snapshot record timestamps are normalized to ReductStore microseconds before duplicate detection and delivery. Record identity is `entry + timestamp`. Per-measurement Xentara source times remain in the optional JSON `sourceTime` object.
 
 Collection only reads, serializes, and enqueues. A worker performs HTTP I/O, batching up to 64 records, 4 MiB payload, 6 KiB metadata, or two seconds. Queue limits include queued and in-flight records. Transient failures use bounded exponential backoff. Permanent failures retain affected records and stop delivery until cleanup. Process crashes and cleanup after a bounded final flush can lose in-memory records; failures and overflow are exposed through writer attributes and events.
 

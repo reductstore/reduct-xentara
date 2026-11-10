@@ -23,6 +23,7 @@ using TimePoint = std::chrono::time_point<std::chrono::system_clock>;
 using Labels = std::map<std::string, std::string>;
 
 [[nodiscard]] auto normalizeTimestamp(TimePoint timestamp) -> TimePoint;
+[[nodiscard]] auto unixMicroseconds(TimePoint timestamp) -> std::int64_t;
 
 struct Record
 {
