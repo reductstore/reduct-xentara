@@ -24,20 +24,21 @@ xentara --plugin build/reductstore-xentara.json --model examples/model.json
 
 ## Configuration
 
-`@Skill.ReductStore.Client` owns an asynchronous uploader. Required fields are `serverUrl`, `bucket`, and `entryPrefix`. `apiToken` is optional only for servers configured for anonymous access.
+`@Skill.ReductStore.Client` owns an asynchronous uploader. Required fields are `serverUrl` and `bucket`. `apiToken` is optional only for servers configured for anonymous access.
 
 | Field | Type | Default | Meaning |
 | --- | --- | --- | --- |
 | `serverUrl` | string | required | `http://` or `https://` ReductStore URL |
 | `apiToken` | string | empty | ReductStore API token |
 | `bucket` | string | required | Destination bucket |
-| `entryPrefix` | string | required | Relative, stable device path prepended to every entry |
+| `entryPrefix` | string | empty | Optional relative device path prepended to every entry; recommended for shared buckets |
 | `host` | string | `auto` | `host` record label; `auto` reads the operating-system hostname |
 | `connectionTimeout` | duration | `2s` | Connection timeout |
 | `requestTimeout` | duration | `10s` | Request timeout |
 | `createBucket` | Boolean | `false` | Create the destination bucket if missing |
-| `maxBatchRecords` | integer | `256` | Small-record batch limit |
+| `maxBatchRecords` | integer | `64` | Small-record batch limit, below ReductStore's default 85-record server limit |
 | `maxBatchPayloadBytes` | integer | `4194304` | Small-record batch payload limit |
+| `maxBatchMetadataBytes` | integer | `6144` | Entry, content-type, and label budget per batch, below the default 8 KiB server limit |
 | `maxBatchAge` | duration | `2s` | Maximum age before flush |
 | `maxQueueBytes` | integer | `16777216` | Memory budget for queued and in-flight record payloads and metadata |
 | `overflowPolicy` | string | `rejectNewest` | `rejectNewest` or `dropOldest` |
@@ -45,7 +46,7 @@ xentara --plugin build/reductstore-xentara.json --model examples/model.json
 | `retry.initialBackoff` | duration | `100ms` | Initial retry delay |
 | `retry.maximumBackoff` | duration | `2s` | Maximum retry delay |
 
-`@Skill.ReductStore.Writer.records` maps one `dataPoint` to one relative `entry`. Point records support static `labels` and `timestampSource`: `scheduled`, `sourceTime`, or `updateTime`. The Client `entryPrefix` namespaces the final entry.
+`@Skill.ReductStore.Writer.records` maps one `dataPoint` to one relative `entry`. Point records support static `labels` and `timestampSource`: `scheduled`, `sourceTime`, or `updateTime`. If configured, the Client `entryPrefix` namespaces the final entry. Without it, `entry` is the complete relative ReductStore entry path.
 
 `@Skill.ReductStore.Writer.recordGroups` supports `snapshot` groups. A group requires `mode: "snapshot"`, a relative `entry`, `timestampSource: "scheduled"`, and a non-empty `measurements` object mapping JSON field names to Xentara data points. One successful collection produces one `application/json` record:
 
@@ -59,11 +60,11 @@ The writer serializes Boolean, signed integer, unsigned integer, and floating-po
 
 ## Timestamp and delivery policy
 
-`scheduled` uses the pipeline scheduled time. `sourceTime` and `updateTime` preserve the Xentara time-point precision and suppress repeated timestamps per point mapping. Snapshot groups require `scheduled`: their one timestamp describes the pipeline cycle, not independently sampled hardware timestamps. ReductStore canonicalizes record timestamps to microseconds, where `entry + timestamp` is immutable record identity. Use `updateTime` when unchanged point values must not produce duplicate ReductStore records.
+`scheduled` uses the pipeline scheduled time. `sourceTime` and `updateTime` use the corresponding Xentara time-point and suppress repeated timestamps per point mapping. Snapshot groups require `scheduled`: their one timestamp describes the pipeline cycle, not independently sampled hardware timestamps. Before duplicate detection and delivery, the skill normalizes every timestamp to microseconds because ReductStore identifies immutable records by `entry + timestamp` at microsecond precision. Use `updateTime` when unchanged point values must not produce duplicate ReductStore records.
 
-The collection task only reads, serializes, and enqueues. A worker thread performs all network I/O. It flushes on 256 records, 4 MiB, or two seconds by default using multi-entry `IBucket::WriteBatch()`. File payloads above the batch threshold use `IBucket::Write()` with the SDK callback and bounded chunks. The total file length is determined before upload.
+The collection task only reads, serializes, and enqueues. A worker thread performs all network I/O. It flushes on 64 records, 4 MiB payload, 6 KiB metadata, or two seconds by default using multi-entry `IBucket::WriteBatch()`. The independently tested `FilePayload` transport uses `IBucket::Write()` with bounded callback chunks and a known total length. It is available to a future Xentara binary source adapter; the current public Xentara data-point adapter does not claim arbitrary binary or image ingestion.
 
-The queue reserves memory for every queued and in-flight record, including entries, content types, and labels. Writer attributes expose `queuedBytes`, `queuedRecords`, `failedRecords`, `collectionFailures`, `duplicateSnapshots`, `rejectedRecords`, `droppedRecords`, and `lastSuccessfulSendTime`; rejected, dropped, and collection-failure records raise `sendError`. `rejectNewest` increments `rejectedRecords` and preserves already reserved data. `dropOldest` increments `droppedRecords`. Process crashes lose the in-memory queue. Failed batches remain reserved while the worker retries them. Shutdown uses the configured request timeout and bounded retry count, then releases reservations and reports undelivered data. ReductStore records are immutable. A transport failure after the server accepts data is ambiguous: the skill never marks it delivered without an SDK success response, so an operator may need to resolve a duplicate-timestamp conflict before retrying.
+The queue reserves memory for every queued and in-flight record, including entries, content types, and labels. Writer attributes expose `queuedBytes`, `queuedRecords`, `failedRecords`, `collectionFailures`, `duplicateSnapshots`, `rejectedRecords`, `droppedRecords`, and `lastSuccessfulSendTime`; rejected, dropped, and collection-failure records raise `sendError`. `rejectNewest` increments `rejectedRecords` and preserves already reserved data. `dropOldest` increments `droppedRecords`. Process crashes lose the in-memory queue. Transient failures retry with the configured bounded exponential backoff. A permanent write failure retains affected records and stops delivery until cleanup, avoiding repeated writes that cannot succeed. Cleanup has a bounded final flush, then releases undelivered reservations and reports their count. ReductStore records are immutable. A transport failure after the server accepts data is ambiguous: the skill never marks it delivered without an SDK success response, so an operator may need to resolve a duplicate-timestamp conflict before retrying.
 
 ## Local demo
 

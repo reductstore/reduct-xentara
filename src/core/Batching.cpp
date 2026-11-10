@@ -9,12 +9,27 @@
 namespace reductstore_xentara
 {
 
+auto normalizeTimestamp(TimePoint timestamp) -> TimePoint
+{
+	return std::chrono::time_point_cast<std::chrono::microseconds>(timestamp);
+}
+
 auto Record::storageBytes() const noexcept -> std::size_t
 {
 	auto bytes = sizeof(Record) + entry.capacity() + contentType.capacity() + payload.capacity();
 	for (const auto& [key, value] : labels)
 	{
 		bytes += sizeof(Labels::value_type) + key.capacity() + value.capacity();
+	}
+	return bytes;
+}
+
+auto Record::metadataBytes() const noexcept -> std::size_t
+{
+	auto bytes = entry.size() + contentType.size();
+	for (const auto& [key, value] : labels)
+	{
+		bytes += key.size() + value.size() + 2;
 	}
 	return bytes;
 }
@@ -31,18 +46,21 @@ auto BatchPlanner::push(Record record, std::chrono::steady_clock::time_point col
 		_firstCollectedAt = collectedAt;
 	}
 	_payloadBytes += record.payload.size();
+	_metadataBytes += record.metadataBytes();
 	_records.push_back(std::move(record));
 }
 
 auto BatchPlanner::shouldFlush(std::chrono::steady_clock::time_point now) const -> bool
 {
 	return !_records.empty() &&
-		(_records.size() >= _limits.maxRecords || _payloadBytes >= _limits.maxPayloadBytes || now - *_firstCollectedAt >= _limits.maxAge);
+		(_records.size() >= _limits.maxRecords || _payloadBytes >= _limits.maxPayloadBytes ||
+			_metadataBytes >= _limits.maxMetadataBytes || now - *_firstCollectedAt >= _limits.maxAge);
 }
 
 auto BatchPlanner::take() -> std::vector<Record>
 {
 	_payloadBytes = 0;
+	_metadataBytes = 0;
 	_firstCollectedAt.reset();
 	return std::exchange(_records, {});
 }

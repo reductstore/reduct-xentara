@@ -174,10 +174,6 @@ auto UplinkWorker::enqueue(Record record) -> bool
 	return _queue.push(std::move(record));
 }
 
-auto UplinkWorker::requestFlush() -> void
-{
-	_flushRequested = true;
-}
 
 auto UplinkWorker::status() const -> DeliveryStatus
 {
@@ -207,10 +203,34 @@ auto UplinkWorker::setFailure(std::string error) -> void
 
 auto UplinkWorker::run() -> void
 {
-	BatchPlanner planner({ _configuration.maxBatchRecords, _configuration.maxBatchPayloadBytes, _configuration.maxBatchAge });
 	ReductTransport transport(_configuration);
+	BatchPlanner planner({
+		_configuration.maxBatchRecords,
+		_configuration.maxBatchPayloadBytes,
+		_configuration.maxBatchMetadataBytes,
+		_configuration.maxBatchAge,
+	});
 	std::vector<Record> pending;
 	std::optional<std::chrono::steady_clock::time_point> shutdownDeadline;
+	auto releaseUndelivered = [this, &planner, &pending] {
+		auto undelivered = pending.size();
+		for (const auto& record : pending)
+		{
+			_queue.release(record);
+		}
+		pending.clear();
+		for (const auto& record : planner.take())
+		{
+			_queue.release(record);
+			++undelivered;
+		}
+		while (auto record = _queue.tryPop())
+		{
+			_queue.release(*record);
+			++undelivered;
+		}
+		return undelivered;
+	};
 	while (_running || !planner.empty() || _queue.size() != 0 || !pending.empty())
 	{
 		if (!_running && !shutdownDeadline)
@@ -219,21 +239,7 @@ auto UplinkWorker::run() -> void
 		}
 		if (shutdownDeadline && std::chrono::steady_clock::now() >= *shutdownDeadline)
 		{
-			auto undelivered = pending.size();
-			for (const auto& record : pending)
-			{
-				_queue.release(record);
-			}
-			for (const auto& record : planner.take())
-			{
-				_queue.release(record);
-				++undelivered;
-			}
-			while (auto record = _queue.tryPop())
-			{
-				_queue.release(*record);
-				++undelivered;
-			}
+			const auto undelivered = releaseUndelivered();
 			{
 				std::lock_guard lock(_statusMutex);
 				_status.failedRecords = undelivered;
@@ -251,7 +257,7 @@ auto UplinkWorker::run() -> void
 			{
 				continue;
 			}
-			if (!_flushRequested.exchange(false) && !planner.shouldFlush(std::chrono::steady_clock::now()) && _running)
+			if (!planner.shouldFlush(std::chrono::steady_clock::now()) && _running)
 			{
 				continue;
 			}
@@ -296,6 +302,19 @@ auto UplinkWorker::run() -> void
 			_status.failedRecords = pending.size();
 		}
 		setFailure(result.error);
+		if (!result.retryable && !pending.empty())
+		{
+			while (_running)
+			{
+				std::this_thread::sleep_for(std::chrono::milliseconds(50));
+			}
+			const auto undelivered = releaseUndelivered();
+			{
+				std::lock_guard lock(_statusMutex);
+				_status.failedRecords = undelivered;
+			}
+			return;
+		}
 		std::this_thread::sleep_for(_configuration.retry.maximumBackoff);
 	}
 }

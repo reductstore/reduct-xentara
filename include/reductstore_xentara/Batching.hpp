@@ -23,6 +23,8 @@ namespace reductstore_xentara
 using TimePoint = std::chrono::time_point<std::chrono::system_clock>;
 using Labels = std::map<std::string, std::string>;
 
+[[nodiscard]] auto normalizeTimestamp(TimePoint timestamp) -> TimePoint;
+
 struct Record
 {
 	std::string entry;
@@ -32,6 +34,7 @@ struct Record
 	Labels labels;
 
 	[[nodiscard]] auto storageBytes() const noexcept -> std::size_t;
+	[[nodiscard]] auto metadataBytes() const noexcept -> std::size_t;
 };
 
 struct RecordIdentity
@@ -44,8 +47,9 @@ struct RecordIdentity
 
 struct BatchLimits
 {
-	std::size_t maxRecords { 256 };
+	std::size_t maxRecords { 64 };
 	std::size_t maxPayloadBytes { 4U * 1024U * 1024U };
+	std::size_t maxMetadataBytes { 6U * 1024U };
 	std::chrono::milliseconds maxAge { 2000 };
 };
 
@@ -62,6 +66,7 @@ private:
 	BatchLimits _limits;
 	std::vector<Record> _records;
 	std::size_t _payloadBytes { 0 };
+	std::size_t _metadataBytes { 0 };
 	std::optional<std::chrono::steady_clock::time_point> _firstCollectedAt;
 };
 

@@ -53,7 +53,6 @@ public:
 	auto start() -> void;
 	auto stop() -> void;
 	[[nodiscard]] auto enqueue(Record record) -> bool;
-	auto requestFlush() -> void;
 	[[nodiscard]] auto status() const -> DeliveryStatus;
 	[[nodiscard]] auto rejectedRecords() const -> std::size_t;
 	[[nodiscard]] auto droppedRecords() const -> std::size_t;
@@ -65,7 +64,6 @@ private:
 	ClientConfiguration _configuration;
 	BoundedQueue _queue;
 	std::atomic<bool> _running { false };
-	std::atomic<bool> _flushRequested { false };
 	std::thread _thread;
 	mutable std::mutex _statusMutex;
 	DeliveryStatus _status;

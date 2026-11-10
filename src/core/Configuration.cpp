@@ -17,7 +17,8 @@ auto validate(const ClientConfiguration& configuration) -> std::string
 	{
 		return "timeouts must be positive";
 	}
-	if (configuration.maxBatchRecords == 0 || configuration.maxBatchPayloadBytes == 0 || configuration.maxBatchAge.count() <= 0)
+	if (configuration.maxBatchRecords == 0 || configuration.maxBatchPayloadBytes == 0 ||
+		configuration.maxBatchMetadataBytes == 0 || configuration.maxBatchAge.count() <= 0)
 	{
 		return "batch limits must be positive";
 	}
@@ -30,6 +31,20 @@ auto validate(const ClientConfiguration& configuration) -> std::string
 		return "retry policy is invalid";
 	}
 	return {};
+}
+
+auto entryName(std::string_view prefix, std::string_view entry) -> std::string
+{
+	if (prefix.empty())
+	{
+		return std::string(entry);
+	}
+	std::string result;
+	result.reserve(prefix.size() + 1 + entry.size());
+	result.append(prefix);
+	result.push_back('/');
+	result.append(entry);
+	return result;
 }
 
 }

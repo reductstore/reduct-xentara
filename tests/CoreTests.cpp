@@ -40,6 +40,16 @@ void rejectsInvalidConfiguration()
 	config.bucket = "demo";
 	config.maxBatchRecords = 0;
 	check(!validate(config).empty(), "a zero batch record limit must be rejected");
+
+	config.maxBatchRecords = 64;
+	config.maxBatchMetadataBytes = 0;
+	check(!validate(config).empty(), "a zero batch metadata limit must be rejected");
+}
+
+void namespacesEntriesWithoutMandatoryPrefix()
+{
+	check(entryName({}, "telemetry") == "telemetry", "an empty prefix must preserve a complete entry path");
+	check(entryName("edge-a", "telemetry") == "edge-a/telemetry", "a configured prefix must namespace the entry");
 }
 
 void serializesNumericMeasurements()
@@ -80,9 +90,11 @@ void serializesSnapshotQuality()
 
 void preservesTimestampPrecision()
 {
-	const auto timestamp = TimePoint(std::chrono::microseconds(1'731'234'567'890'123));
-	const auto record = Record { "entry", timestamp, "application/json", "42", { { "host", "edge-a" } } };
-	check(record.timestamp == timestamp, "records must retain microsecond timestamps");
+	const auto timestamp = TimePoint(std::chrono::nanoseconds(1'731'234'567'890'123'789LL));
+	const auto normalized = normalizeTimestamp(timestamp);
+	check(normalized == TimePoint(std::chrono::microseconds(1'731'234'567'890'123)), "record timestamps must truncate to ReductStore microseconds");
+	const auto record = Record { "entry", normalized, "application/json", "42", { { "host", "edge-a" } } };
+	check(record.timestamp == normalized, "records must retain normalized timestamps");
 	check(record.labels.at("host") == "edge-a", "record labels must be retained");
 }
 
@@ -99,6 +111,21 @@ void selectsBatchBoundaries()
 	planner.push(Record { "b", {}, "application/json", "345", {} }, now);
 	check(planner.shouldFlush(now), "the payload threshold must flush a batch");
 	check(planner.take().size() == 2, "the planner must keep multiple entries together");
+}
+
+void flushesAtMetadataBoundary()
+{
+	BatchLimits limits;
+	limits.maxRecords = 3;
+	limits.maxPayloadBytes = 100;
+	limits.maxMetadataBytes = 2;
+	limits.maxAge = std::chrono::seconds(2);
+	BatchPlanner planner(limits);
+	const auto now = std::chrono::steady_clock::now();
+	planner.push(Record { "a", {}, "", "", {} }, now);
+	check(!planner.shouldFlush(now), "one metadata record must remain queued");
+	planner.push(Record { "b", {}, "", "", {} }, now);
+	check(planner.shouldFlush(now), "the metadata threshold must flush a batch");
 }
 
 void accountsForMetadataAndInflightRecords()
@@ -135,6 +162,18 @@ void retriesTransientFailures()
 	});
 	check(result.delivered, "a retry succeeding within the bound must be delivered");
 	check(attempts == 3, "transient failures must use the configured retry bound");
+}
+
+void doesNotRetryPermanentFailures()
+{
+	RetryPolicy retry { 3, std::chrono::milliseconds(0), std::chrono::milliseconds(0) };
+	std::size_t attempts = 0;
+	const auto result = retryTransient(retry, [&attempts] {
+		++attempts;
+		return UploadResult { false, false, "forbidden", {} };
+	});
+	check(!result.delivered, "a permanent failure must remain undelivered");
+	check(attempts == 1, "a permanent failure must not be retried");
 }
 
 void rejectsOverflowWithoutDiscardingQueuedRecords()
@@ -201,14 +240,17 @@ int main()
 {
 	const std::vector<std::pair<std::string, std::function<void()>>> tests {
 		{ "rejects invalid configuration", rejectsInvalidConfiguration },
+		{ "namespaces optional entry prefixes", namespacesEntriesWithoutMandatoryPrefix },
 		{ "serializes numeric measurements", serializesNumericMeasurements },
 		{ "serializes scheduled snapshots", serializesScheduledSnapshot },
 		{ "serializes snapshot quality", serializesSnapshotQuality },
 		{ "preserves timestamp precision", preservesTimestampPrecision },
 		{ "selects batch boundaries", selectsBatchBoundaries },
+		{ "flushes at metadata boundary", flushesAtMetadataBoundary },
 		{ "accounts for metadata and in-flight records", accountsForMetadataAndInflightRecords },
 		{ "rejects queue overflow", rejectsOverflowWithoutDiscardingQueuedRecords },
 		{ "retries transient failures", retriesTransientFailuresAndPreservesPartialFailures },
+		{ "does not retry permanent failures", doesNotRetryPermanentFailures },
 		{ "releases pending records on shutdown", releasesPendingRecordsOnShutdown },
 		{ "streams files in bounded chunks", streamsFilesInBoundedChunks },
 	};

@@ -3,6 +3,7 @@
 #include <chrono>
 #include <cstddef>
 #include <string>
+#include <string_view>
 
 namespace reductstore_xentara
 {
@@ -28,8 +29,9 @@ struct ClientConfiguration
 	std::chrono::milliseconds connectionTimeout { 2000 };
 	std::chrono::milliseconds requestTimeout { 10000 };
 	bool createBucket { false };
-	std::size_t maxBatchRecords { 256 };
+	std::size_t maxBatchRecords { 64 };
 	std::size_t maxBatchPayloadBytes { 4U * 1024U * 1024U };
+	std::size_t maxBatchMetadataBytes { 6U * 1024U };
 	std::chrono::milliseconds maxBatchAge { 2000 };
 	std::size_t maxQueueBytes { 16U * 1024U * 1024U };
 	OverflowPolicy overflowPolicy { OverflowPolicy::RejectNewest };
@@ -37,5 +39,6 @@ struct ClientConfiguration
 };
 
 [[nodiscard]] auto validate(const ClientConfiguration& configuration) -> std::string;
+[[nodiscard]] auto entryName(std::string_view prefix, std::string_view entry) -> std::string;
 
 }

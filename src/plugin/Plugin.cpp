@@ -20,7 +20,6 @@
 #include <xentara/utils/json/decoder/Errors.hpp>
 #include <xentara/utils/json/decoder/Object.hpp>
 
-#include <format>
 #include <stdexcept>
 #include <string_view>
 
@@ -135,6 +134,7 @@ auto ReductClient::load(utils::json::decoder::Object& object, config::Context&) 
 		else if (name == "createBucket"sv) _configuration.createBucket = value.asBoolean();
 		else if (name == "maxBatchRecords"sv) _configuration.maxBatchRecords = value.asNumber<std::size_t>();
 		else if (name == "maxBatchPayloadBytes"sv) _configuration.maxBatchPayloadBytes = value.asNumber<std::size_t>();
+		else if (name == "maxBatchMetadataBytes"sv) _configuration.maxBatchMetadataBytes = value.asNumber<std::size_t>();
 		else if (name == "maxBatchAge"sv) _configuration.maxBatchAge = value.toTimeDuration<std::chrono::milliseconds>();
 		else if (name == "maxQueueBytes"sv) _configuration.maxQueueBytes = value.asNumber<std::size_t>();
 		else if (name == "overflowPolicy"sv) _configuration.overflowPolicy = parseOverflowPolicy(value);
@@ -158,9 +158,9 @@ auto ReductClient::load(utils::json::decoder::Object& object, config::Context&) 
 
 auto ReductClient::prepare() -> void
 {
-	if (!isRelativeEntry(_entryPrefix))
+	if (!_entryPrefix.empty() && !isRelativeEntry(_entryPrefix))
 	{
-		throw std::runtime_error("entryPrefix must be a non-empty relative entry path");
+		throw std::runtime_error("entryPrefix must be a relative entry path");
 	}
 	if (_host.empty() || _host == "auto")
 	{
@@ -265,12 +265,12 @@ auto ReductWriter::Mapping::valuePayload() const -> std::optional<std::string>
 
 auto ReductWriter::Mapping::collect(std::chrono::system_clock::time_point scheduledTime, const std::string& host, const std::string& entryPrefix) -> std::optional<reductstore_xentara::Record>
 {
-	auto recordTimestamp = scheduledTime;
+	auto recordTimestamp = reductstore_xentara::normalizeTimestamp(scheduledTime);
 	if (timestampSource != TimestampSource::Scheduled)
 	{
 		auto valueTimestamp = timestamp.read<std::chrono::system_clock::time_point>();
 		if (!valueTimestamp) return std::nullopt;
-		recordTimestamp = *valueTimestamp;
+		recordTimestamp = reductstore_xentara::normalizeTimestamp(*valueTimestamp);
 		if (lastTimestamp == recordTimestamp) return std::nullopt;
 	}
 	auto payload = valuePayload();
@@ -283,7 +283,7 @@ auto ReductWriter::Mapping::collect(std::chrono::system_clock::time_point schedu
 	recordLabels["host"] = host;
 	lastTimestamp = recordTimestamp;
 	return reductstore_xentara::Record {
-		std::format("{}/{}", entryPrefix, entry),
+		reductstore_xentara::entryName(entryPrefix, entry),
 		recordTimestamp,
 		"application/json",
 		std::move(*payload),
@@ -298,7 +298,8 @@ auto ReductWriter::Snapshot::resolve() -> void
 
 auto ReductWriter::Snapshot::collect(std::chrono::system_clock::time_point scheduledTime, const std::string& host, const std::string& entryPrefix) -> CollectionResult
 {
-	if (lastTimestamp == scheduledTime)
+	const auto recordTimestamp = reductstore_xentara::normalizeTimestamp(scheduledTime);
+	if (lastTimestamp == recordTimestamp)
 	{
 		return { CollectionStatus::Duplicate, std::nullopt };
 	}
@@ -322,12 +323,12 @@ auto ReductWriter::Snapshot::collect(std::chrono::system_clock::time_point sched
 	auto recordLabels = labels;
 	recordLabels["host"] = host;
 	recordLabels["quality"] = data::toString(*aggregateQuality);
-	lastTimestamp = scheduledTime;
+	lastTimestamp = recordTimestamp;
 	return {
 		CollectionStatus::Collected,
 		reductstore_xentara::Record {
-			std::format("{}/{}", entryPrefix, entry),
-			scheduledTime,
+			reductstore_xentara::entryName(entryPrefix, entry),
+			recordTimestamp,
 			"application/json",
 			reductstore_xentara::serializeObject({
 				{ "measurements", reductstore_xentara::serializeObject(values) },
@@ -474,7 +475,6 @@ auto ReductWriter::collect(const process::ExecutionContext& context) -> void
 
 auto ReductWriter::flush(const process::ExecutionContext& context) -> void
 {
-	_client.get().worker().requestFlush();
 	updateState(context.scheduledTime());
 }
 

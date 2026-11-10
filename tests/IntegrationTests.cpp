@@ -41,8 +41,9 @@ auto configuration() -> ClientConfiguration
 	config.apiToken = environment("REDUCTSTORE_TOKEN", "xentara-demo-token");
 	config.bucket = "xentara-integration";
 	config.createBucket = true;
-	config.maxBatchRecords = 256;
+	config.maxBatchRecords = 64;
 	config.maxBatchPayloadBytes = 4U * 1024U * 1024U;
+	config.maxBatchMetadataBytes = 6U * 1024U;
 	config.maxBatchAge = std::chrono::seconds(2);
 	return config;
 }
