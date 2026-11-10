@@ -138,7 +138,6 @@ private:
 	auto realize() -> void final;
 	auto prepare() -> void final;
 	auto collect(const process::ExecutionContext& context) -> void;
-	auto flush(const process::ExecutionContext& context) -> void;
 	auto updateState(std::chrono::system_clock::time_point timestamp) -> void;
 
 	std::reference_wrapper<ReductClient> _client;

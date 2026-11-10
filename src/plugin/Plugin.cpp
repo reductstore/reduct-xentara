@@ -473,10 +473,6 @@ auto ReductWriter::collect(const process::ExecutionContext& context) -> void
 	updateState(context.scheduledTime());
 }
 
-auto ReductWriter::flush(const process::ExecutionContext& context) -> void
-{
-	updateState(context.scheduledTime());
-}
 
 auto ReductWriter::updateState(std::chrono::system_clock::time_point timestamp) -> void
 {
@@ -518,7 +514,7 @@ ReductWriter::CollectTask::CollectTask(ReductWriter& target) : _target(target) {
 auto ReductWriter::CollectTask::operational(const process::ExecutionContext& context) -> void { _target.get().collect(context); }
 ReductWriter::SendTask::SendTask(ReductWriter& target) : _target(target) {}
 auto ReductWriter::SendTask::stages() const -> Stages { return Stage::Operational | Stage::PostOperational; }
-auto ReductWriter::SendTask::operational(const process::ExecutionContext& context) -> void { _target.get().flush(context); }
-auto ReductWriter::SendTask::preparePostOperational(const process::ExecutionContext& context) -> Status { _target.get().flush(context); return Status::Completed; }
+auto ReductWriter::SendTask::operational(const process::ExecutionContext& context) -> void { _target.get().updateState(context.scheduledTime()); }
+auto ReductWriter::SendTask::preparePostOperational(const process::ExecutionContext& context) -> Status { _target.get().updateState(context.scheduledTime()); return Status::Completed; }
 
 }
