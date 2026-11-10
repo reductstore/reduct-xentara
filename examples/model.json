@@ -64,7 +64,7 @@
         "serverUrl": "http://127.0.0.1:8383",
         "apiToken": "xentara-demo-token",
         "bucket": "xentara-demo",
-        "host": "xentara-demo",
+        "entryPrefix": "xentara-demo",
         "createBucket": true,
         "connectionTimeout": "2s",
         "requestTimeout": "10s",
@@ -82,16 +82,16 @@
               "recordGroups": [
                 {
                   "mode": "snapshot",
-                  "entry": "signals/snapshot",
+                  "entry": "telemetry/snapshot",
                   "timestampSource": "scheduled",
-                  "fields": [
-                    { "name": "pulse", "dataPoint": "Signals.Pulse" },
-                    { "name": "sine", "dataPoint": "Signals.Sine Wave" },
-                    { "name": "triangle", "dataPoint": "Signals.Triangle" },
-                    { "name": "sawTooth", "dataPoint": "Signals.Saw-Tooth" },
-                    { "name": "invertedSawTooth", "dataPoint": "Signals.Inverted Saw-Tooth" },
-                    { "name": "noise", "dataPoint": "Signals.Noise" }
-                  ]
+                  "measurements": {
+                    "pulse": "Signals.Pulse",
+                    "sine": "Signals.Sine Wave",
+                    "triangle": "Signals.Triangle",
+                    "sawTooth": "Signals.Saw-Tooth",
+                    "invertedSawTooth": "Signals.Inverted Saw-Tooth",
+                    "noise": "Signals.Noise"
+                  }
                 }
               ]
             }

@@ -37,6 +37,7 @@ public:
 	auto category() const noexcept -> model::ElementCategory final;
 	[[nodiscard]] auto worker() -> reductstore_xentara::UplinkWorker&;
 	[[nodiscard]] auto host() const -> const std::string&;
+	[[nodiscard]] auto entryPrefix() const -> const std::string&;
 
 private:
 	auto load(utils::json::decoder::Object& object, config::Context& context) -> void final;
@@ -44,7 +45,8 @@ private:
 	auto cleanup() -> void final;
 
 	reductstore_xentara::ClientConfiguration _configuration;
-	std::string _host;
+	std::string _entryPrefix;
+	std::string _host { "auto" };
 	std::unique_ptr<reductstore_xentara::UplinkWorker> _worker;
 };
 
@@ -69,6 +71,8 @@ private:
 		std::uint64_t rejectedRecords { 0 };
 		std::uint64_t droppedRecords { 0 };
 		std::uint64_t failedRecords { 0 };
+		std::uint64_t collectionFailures { 0 };
+		std::uint64_t duplicateSnapshots { 0 };
 		std::error_code error;
 		std::chrono::system_clock::time_point lastSuccessfulSendTime { std::chrono::system_clock::time_point::min() };
 	};
@@ -89,17 +93,25 @@ private:
 
 		auto resolve() -> void;
 		[[nodiscard]] auto valuePayload() const -> std::optional<std::string>;
-		[[nodiscard]] auto collect(std::chrono::system_clock::time_point scheduledTime, const std::string& host) -> std::optional<reductstore_xentara::Record>;
+		[[nodiscard]] auto collect(std::chrono::system_clock::time_point scheduledTime, const std::string& host, const std::string& entryPrefix) -> std::optional<reductstore_xentara::Record>;
 	};
 
 	struct Snapshot
 	{
+		enum class CollectionStatus { Collected, Duplicate, Incomplete };
+		struct CollectionResult
+		{
+			CollectionStatus status;
+			std::optional<reductstore_xentara::Record> record;
+		};
+
 		std::string entry;
 		reductstore_xentara::Labels labels;
-		std::vector<Mapping> fields;
+		std::vector<Mapping> measurements;
+		std::optional<std::chrono::system_clock::time_point> lastTimestamp;
 
 		auto resolve() -> void;
-		[[nodiscard]] auto collect(std::chrono::system_clock::time_point scheduledTime, const std::string& host) const -> std::optional<reductstore_xentara::Record>;
+		[[nodiscard]] auto collect(std::chrono::system_clock::time_point scheduledTime, const std::string& host, const std::string& entryPrefix) -> CollectionResult;
 	};
 
 	class CollectTask final : public process::Task
@@ -138,6 +150,9 @@ private:
 	SendTask _sendTask;
 	memory::ObjectBlock<State> _state;
 	std::size_t _observedDelivered { 0 };
+	std::size_t _collectionFailures { 0 };
+	std::size_t _observedCollectionFailures { 0 };
+	std::size_t _duplicateSnapshots { 0 };
 };
 class Skill final : public skill::Skill
 {

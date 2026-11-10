@@ -60,6 +60,24 @@ void serializesScheduledSnapshot()
 	check(serializeObject(fields) == "{\"pulse\":true,\"sine\":74.3,\"quoted\\\"field\":-2}", "a snapshot must serialize named JSON fields");
 }
 
+void serializesSnapshotQuality()
+{
+	const auto measurements = serializeObject({
+		{ "pulse", "true" },
+		{ "sine", "74.3" },
+	});
+	const auto quality = serializeObject({
+		{ "pulse", serializeString("Good") },
+		{ "sine", serializeString("Acceptable") },
+	});
+	const auto payload = serializeObject({
+		{ "measurements", measurements },
+		{ "quality", quality },
+	});
+	check(payload == "{\"measurements\":{\"pulse\":true,\"sine\":74.3},\"quality\":{\"pulse\":\"Good\",\"sine\":\"Acceptable\"}}",
+		"a snapshot must retain values and per-measurement quality");
+}
+
 void preservesTimestampPrecision()
 {
 	const auto timestamp = TimePoint(std::chrono::microseconds(1'731'234'567'890'123));
@@ -185,6 +203,7 @@ int main()
 		{ "rejects invalid configuration", rejectsInvalidConfiguration },
 		{ "serializes numeric measurements", serializesNumericMeasurements },
 		{ "serializes scheduled snapshots", serializesScheduledSnapshot },
+		{ "serializes snapshot quality", serializesSnapshotQuality },
 		{ "preserves timestamp precision", preservesTimestampPrecision },
 		{ "selects batch boundaries", selectsBatchBoundaries },
 		{ "accounts for metadata and in-flight records", accountsForMetadataAndInflightRecords },

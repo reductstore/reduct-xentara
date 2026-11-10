@@ -24,6 +24,8 @@
 #include <stdexcept>
 #include <string_view>
 
+#include <unistd.h>
+
 namespace xentara::plugins::reductstore
 {
 
@@ -39,6 +41,8 @@ const model::Attribute kQueuedBytes { "b6350cac-b1ae-44a4-b5ef-5b4d2fb5c2d5"_uui
 const model::Attribute kRejectedRecords { "a065417d-5e59-4db7-9707-7d03e1f9af17"_uuid, "rejectedRecords"sv, model::Attribute::Access::ReadOnly, data::DataType::kInteger };
 const model::Attribute kDroppedRecords { "a55ee685-69e2-4e9d-b889-64c64eeb6024"_uuid, "droppedRecords"sv, model::Attribute::Access::ReadOnly, data::DataType::kInteger };
 const model::Attribute kFailedRecords { "55c99df4-78e5-4c6a-9d93-870d71a67b5a"_uuid, "failedRecords"sv, model::Attribute::Access::ReadOnly, data::DataType::kInteger };
+const model::Attribute kCollectionFailures { "461a7d30-ec81-41d9-b630-6187eeef6d3d"_uuid, "collectionFailures"sv, model::Attribute::Access::ReadOnly, data::DataType::kInteger };
+const model::Attribute kDuplicateSnapshots { "bbdb44e0-f343-4fd1-b1f9-9e5ab4c62209"_uuid, "duplicateSnapshots"sv, model::Attribute::Access::ReadOnly, data::DataType::kInteger };
 const model::Attribute kLastSuccessfulSendTime { "b33cac6d-19b0-4fc5-b8b9-1c8abcf57cf0"_uuid, "lastSuccessfulSendTime"sv, model::Attribute::Access::ReadOnly, data::DataType::kTimeStamp };
 const model::Attribute kError { model::Attribute::kError, model::Attribute::Access::ReadOnly, data::DataType::kErrorCode };
 const process::Event::Role kSent { "c0d111f6-2f1b-497a-bcaf-837c6f56add6"_uuid, "sent"sv };
@@ -58,6 +62,21 @@ auto parseOverflowPolicy(utils::json::decoder::Value& value) -> reductstore_xent
 		return reductstore_xentara::OverflowPolicy::DropOldest;
 	}
 	throw std::runtime_error("overflowPolicy must be rejectNewest or dropOldest");
+}
+
+auto hostName() -> std::string
+{
+	char buffer[256] {};
+	if (gethostname(buffer, sizeof(buffer) - 1) != 0)
+	{
+		throw std::runtime_error("could not determine host name");
+	}
+	return buffer;
+}
+
+auto isRelativeEntry(std::string_view entry) -> bool
+{
+	return !entry.empty() && entry.front() != '/' && entry.back() != '/' && entry.find("//") == std::string_view::npos;
 }
 
 }
@@ -97,6 +116,11 @@ auto ReductClient::host() const -> const std::string&
 	return _host;
 }
 
+auto ReductClient::entryPrefix() const -> const std::string&
+{
+	return _entryPrefix;
+}
+
 auto ReductClient::load(utils::json::decoder::Object& object, config::Context&) -> void
 {
 	for (auto&& [name, value] : object)
@@ -104,6 +128,7 @@ auto ReductClient::load(utils::json::decoder::Object& object, config::Context&) 
 		if (name == "serverUrl"sv) _configuration.serverUrl = value.asString<std::string>();
 		else if (name == "apiToken"sv) _configuration.apiToken = value.asString<std::string>();
 		else if (name == "bucket"sv) _configuration.bucket = value.asString<std::string>();
+		else if (name == "entryPrefix"sv) _entryPrefix = value.asString<std::string>();
 		else if (name == "host"sv) _host = value.asString<std::string>();
 		else if (name == "connectionTimeout"sv) _configuration.connectionTimeout = value.toTimeDuration<std::chrono::milliseconds>();
 		else if (name == "requestTimeout"sv) _configuration.requestTimeout = value.toTimeDuration<std::chrono::milliseconds>();
@@ -133,6 +158,14 @@ auto ReductClient::load(utils::json::decoder::Object& object, config::Context&) 
 
 auto ReductClient::prepare() -> void
 {
+	if (!isRelativeEntry(_entryPrefix))
+	{
+		throw std::runtime_error("entryPrefix must be a non-empty relative entry path");
+	}
+	if (_host.empty() || _host == "auto")
+	{
+		_host = hostName();
+	}
 	_worker = std::make_unique<reductstore_xentara::UplinkWorker>(_configuration);
 	_worker->start();
 }
@@ -155,7 +188,8 @@ ReductWriter::ReductWriter(std::reference_wrapper<ReductClient> client) :
 auto ReductWriter::forEachAttribute(const model::ForEachAttributeFunction& function) const -> bool
 {
 	return function(kHealthy) || function(kQueuedRecords) || function(kQueuedBytes) || function(kRejectedRecords) ||
-		function(kDroppedRecords) || function(kFailedRecords) || function(kLastSuccessfulSendTime) || function(kError);
+		function(kDroppedRecords) || function(kFailedRecords) || function(kCollectionFailures) ||
+		function(kDuplicateSnapshots) || function(kLastSuccessfulSendTime) || function(kError);
 }
 
 auto ReductWriter::forEachEvent(const model::ForEachEventFunction& function) -> bool
@@ -176,7 +210,10 @@ auto ReductWriter::makeReadHandle(const model::Attribute& attribute) const noexc
 	if (attribute == kRejectedRecords) return _state.member(&State::rejectedRecords);
 	if (attribute == kDroppedRecords) return _state.member(&State::droppedRecords);
 	if (attribute == kFailedRecords) return _state.member(&State::failedRecords);
+	if (attribute == kCollectionFailures) return _state.member(&State::collectionFailures);
+	if (attribute == kDuplicateSnapshots) return _state.member(&State::duplicateSnapshots);
 	if (attribute == kLastSuccessfulSendTime) return _state.member(&State::lastSuccessfulSendTime);
+	if (attribute == kError) return _state.member(&State::error);
 	return std::nullopt;
 }
 
@@ -226,7 +263,7 @@ auto ReductWriter::Mapping::valuePayload() const -> std::optional<std::string>
 	return std::nullopt;
 }
 
-auto ReductWriter::Mapping::collect(std::chrono::system_clock::time_point scheduledTime, const std::string& host) -> std::optional<reductstore_xentara::Record>
+auto ReductWriter::Mapping::collect(std::chrono::system_clock::time_point scheduledTime, const std::string& host, const std::string& entryPrefix) -> std::optional<reductstore_xentara::Record>
 {
 	auto recordTimestamp = scheduledTime;
 	if (timestampSource != TimestampSource::Scheduled)
@@ -243,34 +280,61 @@ auto ReductWriter::Mapping::collect(std::chrono::system_clock::time_point schedu
 	auto recordLabels = labels;
 	recordLabels["quality"] = data::toString(*qualityValue);
 	recordLabels["source"] = source;
-	if (!host.empty()) recordLabels["host"] = host;
+	recordLabels["host"] = host;
 	lastTimestamp = recordTimestamp;
-	return reductstore_xentara::Record { entry, recordTimestamp, "application/json", std::move(*payload), std::move(recordLabels) };
+	return reductstore_xentara::Record {
+		std::format("{}/{}", entryPrefix, entry),
+		recordTimestamp,
+		"application/json",
+		std::move(*payload),
+		std::move(recordLabels),
+	};
 }
 
 auto ReductWriter::Snapshot::resolve() -> void
 {
-	for (auto& field : fields) field.resolve();
+	for (auto& measurement : measurements) measurement.resolve();
 }
 
-auto ReductWriter::Snapshot::collect(std::chrono::system_clock::time_point scheduledTime, const std::string& host) const -> std::optional<reductstore_xentara::Record>
+auto ReductWriter::Snapshot::collect(std::chrono::system_clock::time_point scheduledTime, const std::string& host, const std::string& entryPrefix) -> CollectionResult
 {
-	std::vector<std::pair<std::string, std::string>> values;
-	values.reserve(fields.size());
-	for (const auto& field : fields)
+	if (lastTimestamp == scheduledTime)
 	{
-		auto value = field.valuePayload();
-		if (!value) return std::nullopt;
-		values.emplace_back(field.name, std::move(*value));
+		return { CollectionStatus::Duplicate, std::nullopt };
+	}
+	std::vector<std::pair<std::string, std::string>> values;
+	std::vector<std::pair<std::string, std::string>> qualities;
+	values.reserve(measurements.size());
+	qualities.reserve(measurements.size());
+	std::optional<data::Quality> aggregateQuality;
+	for (const auto& measurement : measurements)
+	{
+		auto value = measurement.valuePayload();
+		auto quality = measurement.quality.read<data::Quality>();
+		if (!value || !quality)
+		{
+			return { CollectionStatus::Incomplete, std::nullopt };
+		}
+		values.emplace_back(measurement.name, std::move(*value));
+		qualities.emplace_back(measurement.name, reductstore_xentara::serializeString(data::toString(*quality)));
+		aggregateQuality = aggregateQuality ? data::combine(*aggregateQuality, *quality) : *quality;
 	}
 	auto recordLabels = labels;
-	if (!host.empty()) recordLabels["host"] = host;
-	return reductstore_xentara::Record {
-		entry,
-		scheduledTime,
-		"application/json",
-		reductstore_xentara::serializeObject(values),
-		std::move(recordLabels),
+	recordLabels["host"] = host;
+	recordLabels["quality"] = data::toString(*aggregateQuality);
+	lastTimestamp = scheduledTime;
+	return {
+		CollectionStatus::Collected,
+		reductstore_xentara::Record {
+			std::format("{}/{}", entryPrefix, entry),
+			scheduledTime,
+			"application/json",
+			reductstore_xentara::serializeObject({
+				{ "measurements", reductstore_xentara::serializeObject(values) },
+				{ "quality", reductstore_xentara::serializeObject(qualities) },
+			}),
+			std::move(recordLabels),
+		},
 	};
 }
 
@@ -288,7 +352,7 @@ auto ReductWriter::load(utils::json::decoder::Object& object, config::Context& c
 				for (auto&& [recordName, recordValue] : item.asObject())
 				{
 					if (recordName == "dataPoint"sv) { context.resolve<model::Element>(recordValue, std::ref(mapping.dataPoint)); dataPointLoaded = true; }
-					else if (recordName == "entry"sv) { mapping.entry = recordValue.asString<std::string>(); entryLoaded = !mapping.entry.empty(); }
+					else if (recordName == "entry"sv) { mapping.entry = recordValue.asString<std::string>(); entryLoaded = isRelativeEntry(mapping.entry); }
 					else if (recordName == "timestampSource"sv)
 					{
 						const auto source = recordValue.asString<std::string>();
@@ -303,7 +367,7 @@ auto ReductWriter::load(utils::json::decoder::Object& object, config::Context& c
 					}
 					else config::throwUnknownParameterError(recordName);
 				}
-				if (!dataPointLoaded || !entryLoaded) throw std::runtime_error("each writer record requires dataPoint and non-empty entry");
+				if (!dataPointLoaded || !entryLoaded) throw std::runtime_error("each writer record requires dataPoint and relative entry");
 				_mappings.push_back(std::move(mapping));
 			}
 		}
@@ -314,7 +378,8 @@ auto ReductWriter::load(utils::json::decoder::Object& object, config::Context& c
 				Snapshot snapshot;
 				bool modeLoaded = false;
 				bool entryLoaded = false;
-				bool fieldsLoaded = false;
+				bool timestampLoaded = false;
+				bool measurementsLoaded = false;
 				for (auto&& [groupName, groupValue] : item.asObject())
 				{
 					if (groupName == "mode"sv)
@@ -325,43 +390,38 @@ auto ReductWriter::load(utils::json::decoder::Object& object, config::Context& c
 					else if (groupName == "entry"sv)
 					{
 						snapshot.entry = groupValue.asString<std::string>();
-						entryLoaded = !snapshot.entry.empty();
+						entryLoaded = isRelativeEntry(snapshot.entry);
 					}
 					else if (groupName == "timestampSource"sv)
 					{
+						timestampLoaded = true;
 						if (groupValue.asString<std::string>() != "scheduled") throw std::runtime_error("snapshot record groups require timestampSource scheduled");
 					}
 					else if (groupName == "labels"sv)
 					{
-						for (auto&& [label, labelValue] : groupValue.asObject()) snapshot.labels.emplace(std::string(label), labelValue.asString<std::string>());
-					}
-					else if (groupName == "fields"sv)
-					{
-						fieldsLoaded = true;
-						for (auto&& fieldValue : groupValue.asArray())
+						for (auto&& [label, labelValue] : groupValue.asObject())
 						{
-							Mapping field;
-							bool dataPointLoaded = false;
-							bool nameLoaded = false;
-							for (auto&& [fieldName, fieldSetting] : fieldValue.asObject())
-							{
-								if (fieldName == "name"sv) { field.name = fieldSetting.asString<std::string>(); nameLoaded = !field.name.empty(); }
-								else if (fieldName == "dataPoint"sv) { context.resolve<model::Element>(fieldSetting, std::ref(field.dataPoint)); dataPointLoaded = true; }
-								else config::throwUnknownParameterError(fieldName);
-							}
-							if (!nameLoaded || !dataPointLoaded) throw std::runtime_error("each snapshot field requires name and dataPoint");
-							for (const auto& existing : snapshot.fields)
-							{
-								if (existing.name == field.name) throw std::runtime_error("snapshot field names must be unique");
-							}
-							snapshot.fields.push_back(std::move(field));
+							if (label == "host"sv || label == "quality"sv) throw std::runtime_error("snapshot labels must not override host or quality");
+							snapshot.labels.emplace(std::string(label), labelValue.asString<std::string>());
+						}
+					}
+					else if (groupName == "measurements"sv)
+					{
+						measurementsLoaded = true;
+						for (auto&& [measurementName, dataPoint] : groupValue.asObject())
+						{
+							if (measurementName.empty()) throw std::runtime_error("snapshot measurement names must be non-empty");
+							Mapping measurement;
+							measurement.name = std::string(measurementName);
+							context.resolve<model::Element>(dataPoint, std::ref(measurement.dataPoint));
+							snapshot.measurements.push_back(std::move(measurement));
 						}
 					}
 					else config::throwUnknownParameterError(groupName);
 				}
-				if (!modeLoaded || !entryLoaded || !fieldsLoaded || snapshot.fields.empty())
+				if (!modeLoaded || !entryLoaded || !timestampLoaded || !measurementsLoaded || snapshot.measurements.empty())
 				{
-					throw std::runtime_error("each snapshot record group requires mode, non-empty entry, and fields");
+					throw std::runtime_error("each snapshot record group requires mode, relative entry, scheduled timestampSource, and measurements");
 				}
 				_snapshots.push_back(std::move(snapshot));
 			}
@@ -389,17 +449,25 @@ auto ReductWriter::collect(const process::ExecutionContext& context) -> void
 {
 	for (auto& mapping : _mappings)
 	{
-		if (auto record = mapping.collect(context.scheduledTime(), _client.get().host()))
+		if (auto record = mapping.collect(context.scheduledTime(), _client.get().host(), _client.get().entryPrefix()))
 		{
 			(void)_client.get().worker().enqueue(std::move(*record));
 		}
 	}
-	for (const auto& snapshot : _snapshots)
+	for (auto& snapshot : _snapshots)
 	{
-		if (auto record = snapshot.collect(context.scheduledTime(), _client.get().host()))
+		auto result = snapshot.collect(context.scheduledTime(), _client.get().host(), _client.get().entryPrefix());
+		if (result.status == Snapshot::CollectionStatus::Incomplete)
 		{
-			(void)_client.get().worker().enqueue(std::move(*record));
+			++_collectionFailures;
+			continue;
 		}
+		if (result.status == Snapshot::CollectionStatus::Duplicate)
+		{
+			++_duplicateSnapshots;
+			continue;
+		}
+		(void)_client.get().worker().enqueue(std::move(*result.record));
 	}
 	updateState(context.scheduledTime());
 }
@@ -413,17 +481,25 @@ auto ReductWriter::flush(const process::ExecutionContext& context) -> void
 auto ReductWriter::updateState(std::chrono::system_clock::time_point timestamp) -> void
 {
 	const auto status = _client.get().worker().status();
+	const auto collectionFailed = _collectionFailures != _observedCollectionFailures;
 	memory::WriteSentinel sentinel { _state };
 	auto& state = *sentinel;
-	state.healthy = status.connected && status.error.empty();
+	state.healthy = status.connected && status.error.empty() && !collectionFailed;
 	state.queuedRecords = status.queuedRecords;
 	state.queuedBytes = status.queuedBytes;
 	state.rejectedRecords = _client.get().worker().rejectedRecords();
 	state.droppedRecords = _client.get().worker().droppedRecords();
 	state.failedRecords = status.failedRecords;
-	state.error = status.error.empty() ? std::error_code {} : std::make_error_code(std::errc::io_error);
+	state.collectionFailures = _collectionFailures;
+	state.duplicateSnapshots = _duplicateSnapshots;
+	state.error = status.error.empty() && !collectionFailed ? std::error_code {} : std::make_error_code(std::errc::io_error);
 	state.lastSuccessfulSendTime = status.lastSuccessfulSendTime;
-	if (status.deliveredRecords > _observedDelivered)
+	if (collectionFailed)
+	{
+		_observedCollectionFailures = _collectionFailures;
+		sentinel.commit(timestamp, _error);
+	}
+	else if (status.deliveredRecords > _observedDelivered)
 	{
 		_observedDelivered = status.deliveredRecords;
 		sentinel.commit(timestamp, _sent);

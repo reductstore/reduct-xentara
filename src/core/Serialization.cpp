@@ -87,6 +87,14 @@ auto serializeScalar(double value) -> std::string
 	return asJsonNumber(value);
 }
 
+auto serializeString(std::string_view value) -> std::string
+{
+	std::string result;
+	result.reserve(jsonStringSize(value));
+	appendJsonString(result, value);
+	return result;
+}
+
 auto serializeObject(const std::vector<std::pair<std::string, std::string>>& fields) -> std::string
 {
 	auto size = std::size_t { 2 };

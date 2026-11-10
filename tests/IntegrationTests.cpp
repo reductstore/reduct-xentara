@@ -1,3 +1,4 @@
+#include "reductstore_xentara/Serialization.hpp"
 #include "reductstore_xentara/Transmission.hpp"
 
 #include <reduct/client.h>
@@ -77,6 +78,38 @@ void writesAndReadsMultipleEntries()
 	check(labels.at("host") == "integration", "stored labels must match");
 }
 
+void writesAndReadsProductionSnapshot()
+{
+	const auto config = configuration();
+	const auto timestamp = TimePoint::clock::now();
+	const auto payload = serializeObject({
+		{ "measurements", serializeObject({ { "pulse", "true" }, { "sine", "74.3" } }) },
+		{ "quality", serializeObject({ { "pulse", serializeString("Good") }, { "sine", serializeString("Acceptable") } }) },
+	});
+	ReductTransport transport(config);
+	const std::vector<Record> records {
+		{ "edge-a/telemetry", timestamp, "application/json", payload, { { "host", "edge-a" }, { "quality", "Acceptable" } } },
+	};
+	check(transport.writeBatch(records).delivered, "production snapshot write must succeed");
+
+	reduct::HttpOptions options {};
+	options.api_token = config.apiToken;
+	options.ssl_verification = true;
+	auto client = reduct::IClient::Build(config.serverUrl, options);
+	auto bucketResult = client->GetBucket(config.bucket);
+	check(!bucketResult.error, "integration bucket must be readable");
+	std::string body;
+	reduct::IBucket::LabelMap labels;
+	const auto error = bucketResult.result->Read("edge-a/telemetry", timestamp, [&](const reduct::IBucket::ReadableRecord& record) {
+		labels = record.labels;
+		return !record.Read([&body](std::string_view chunk) { body.append(chunk); return true; });
+	});
+	check(!error, "stored snapshot must be readable");
+	check(body == payload, "stored snapshot payload must match");
+	check(labels.at("host") == "edge-a", "snapshot host label must match");
+	check(labels.at("quality") == "Acceptable", "snapshot quality label must match");
+}
+
 void streamsTwentyMiBFile()
 {
 	const auto file = std::filesystem::temp_directory_path() / "reductstore-xentara-integration.bin";
@@ -122,6 +155,7 @@ int main()
 	try
 	{
 		writesAndReadsMultipleEntries();
+		writesAndReadsProductionSnapshot();
 		streamsTwentyMiBFile();
 		detectsDuplicateTimestamp();
 		reportsUnavailableServer();
