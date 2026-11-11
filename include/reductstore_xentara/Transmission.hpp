@@ -8,18 +8,13 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
 
 namespace reductstore_xentara
 {
-
-struct EnqueueResult
-{
-	bool accepted { false };
-	std::optional<std::uint64_t> droppedProducerId;
-};
 
 struct DeliveryStatus
 {
@@ -75,14 +70,33 @@ public:
 
 	auto start() -> void;
 	auto stop() -> void;
-	[[nodiscard]] auto enqueue(Record record) -> EnqueueResult;
+	[[nodiscard]] auto enqueue(Record record) -> bool;
 	[[nodiscard]] auto status() const -> DeliveryStatus;
-	[[nodiscard]] auto rejectedRecords() const -> std::size_t;
-	[[nodiscard]] auto droppedRecords() const -> std::size_t;
 
 private:
+	struct RunState
+	{
+		explicit RunState(const ClientConfiguration& configuration);
+
+		BatchPlanner planner;
+		std::vector<Record> pending;
+		std::optional<Record> deferred;
+		std::optional<std::chrono::steady_clock::time_point> shutdownDeadline;
+	};
+
 	auto run() -> void;
 	auto setFailure(int code, std::string error) -> void;
+	auto waitWhileRunning(std::chrono::milliseconds delay) -> void;
+	[[nodiscard]] auto shutdownExpired(const RunState& state) const -> bool;
+	[[nodiscard]] auto requestFitsShutdown(const RunState& state) const -> bool;
+	auto releaseUndelivered(RunState& state) -> void;
+	[[nodiscard]] auto admitRecord(RunState& state, Record record) -> bool;
+	[[nodiscard]] auto applyPartialResult(RunState& state, const UploadResult& result, int transientCode) -> bool;
+	[[nodiscard]] auto sendWithRetry(ReductTransport& transport, RunState& state, bool& partialResolved)
+		-> std::optional<UploadResult>;
+	auto finishBatch(RunState& state, const UploadResult& result, bool partialResolved) -> void;
+	auto accountSuccess(std::vector<Record>& records) -> void;
+	auto accountFailure(std::vector<Record>& records, int code, std::string message) -> void;
 
 	ClientConfiguration _configuration;
 	BoundedQueue _queue;

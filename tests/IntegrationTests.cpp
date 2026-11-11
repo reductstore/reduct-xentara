@@ -139,15 +139,15 @@ void workerCompletesSuccessfulRecordsFromPartialBatch()
 
 	UplinkWorker worker(config);
 	worker.start();
-	check(worker.enqueue(duplicate).accepted, "duplicate record must enter the worker queue");
-	check(worker.enqueue(Record { "partial/success", timestamp, "application/json", "2", {} }).accepted, "successful record must enter the worker queue");
+	check(worker.enqueue(duplicate), "duplicate record must enter the worker queue");
+	check(worker.enqueue(Record { "partial/success", timestamp, "application/json", "2", {} }), "successful record must enter the worker queue");
 	check(waitFor([&worker] {
 		const auto status = worker.status();
 		return status.deliveredRecords == 1 && status.failedRecords == 1;
 	}, std::chrono::seconds(2)), "a partial failure must deliver unaffected records");
 	check(worker.status().lastErrorCode == 409, "the partial failure HTTP status must be retained");
 
-	check(worker.enqueue(Record { "partial/after", timestamp, "application/json", "3", {} }).accepted, "subsequent record must enter the worker queue");
+	check(worker.enqueue(Record { "partial/after", timestamp, "application/json", "3", {} }), "subsequent record must enter the worker queue");
 	check(waitFor([&worker] { return worker.status().deliveredRecords == 2; }, std::chrono::seconds(2)),
 		"a permanent per-record failure must not block later uploads");
 	worker.stop();
@@ -185,7 +185,7 @@ void workerStopsWithinShutdownTimeout()
 	config.retry.maximumBackoff = std::chrono::seconds(1);
 	UplinkWorker worker(config);
 	worker.start();
-	check(worker.enqueue(Record { "shutdown/value", TimePoint::clock::now(), "application/json", "1", {} }).accepted,
+	check(worker.enqueue(Record { "shutdown/value", TimePoint::clock::now(), "application/json", "1", {} }),
 		"shutdown record must enter the queue");
 	check(waitFor([&worker] { return !worker.status().error.empty(); }, std::chrono::seconds(2)),
 		"worker must attempt the unavailable server");
@@ -204,7 +204,7 @@ void workerRecoversQueuedRecordAfterServerRestart()
 	config.shutdownTimeout = std::chrono::seconds(2);
 	UplinkWorker worker(config);
 	worker.start();
-	check(worker.enqueue(Record { "recovery/value", TimePoint::clock::now(), "application/json", "1", {} }).accepted,
+	check(worker.enqueue(Record { "recovery/value", TimePoint::clock::now(), "application/json", "1", {} }),
 		"recovery record must enter the queue");
 	check(waitFor([&worker] { return !worker.status().error.empty(); }, std::chrono::seconds(3)),
 		"worker must report the initial outage");

@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <iterator>
 #include <map>
 #include <stdexcept>
 #include <utility>
@@ -150,6 +151,15 @@ auto partitionPartialBatch(std::vector<Record> records, const UploadResult& resu
 	return outcome;
 }
 
+UplinkWorker::RunState::RunState(const ClientConfiguration& configuration) :
+	planner({
+		configuration.maxBatchRecords,
+		configuration.maxBatchPayloadBytes,
+		configuration.maxBatchMetadataBytes,
+		configuration.maxBatchAge,
+	})
+{
+}
 
 UplinkWorker::UplinkWorker(ClientConfiguration configuration) :
 	_configuration(std::move(configuration)),
@@ -184,7 +194,7 @@ auto UplinkWorker::stop() -> void
 	}
 }
 
-auto UplinkWorker::enqueue(Record record) -> EnqueueResult
+auto UplinkWorker::enqueue(Record record) -> bool
 {
 	const auto producerId = record.producerId;
 	auto result = _queue.push(std::move(record));
@@ -197,9 +207,8 @@ auto UplinkWorker::enqueue(Record record) -> EnqueueResult
 		_status.lastErrorCode = 507;
 		_status.lastErrorCodeByProducer[producerId] = 507;
 		_status.error = "record rejected because the delivery queue is full";
-		return {};
+		return false;
 	}
-	EnqueueResult enqueueResult { true, std::nullopt };
 	for (const auto& dropped : result.droppedRecords)
 	{
 		++_status.failedRecords;
@@ -208,14 +217,9 @@ auto UplinkWorker::enqueue(Record record) -> EnqueueResult
 		_status.lastErrorCode = 507;
 		_status.lastErrorCodeByProducer[dropped.producerId] = 507;
 		_status.error = "record dropped because the delivery queue is full";
-		if (!enqueueResult.droppedProducerId)
-		{
-			enqueueResult.droppedProducerId = dropped.producerId;
-		}
 	}
-	return enqueueResult;
+	return true;
 }
-
 
 auto UplinkWorker::status() const -> DeliveryStatus
 {
@@ -227,16 +231,6 @@ auto UplinkWorker::status() const -> DeliveryStatus
 	return status;
 }
 
-auto UplinkWorker::rejectedRecords() const -> std::size_t
-{
-	return _queue.rejectedRecords();
-}
-
-auto UplinkWorker::droppedRecords() const -> std::size_t
-{
-	return _queue.droppedRecords();
-}
-
 auto UplinkWorker::setFailure(int code, std::string error) -> void
 {
 	std::lock_guard lock(_statusMutex);
@@ -245,240 +239,266 @@ auto UplinkWorker::setFailure(int code, std::string error) -> void
 	_status.error = std::move(error);
 }
 
+auto UplinkWorker::waitWhileRunning(std::chrono::milliseconds delay) -> void
+{
+	const auto until = std::chrono::steady_clock::now() + delay;
+	while (_running && std::chrono::steady_clock::now() < until)
+	{
+		std::this_thread::sleep_for(std::chrono::milliseconds(10));
+	}
+}
+
+auto UplinkWorker::shutdownExpired(const RunState& state) const -> bool
+{
+	return state.shutdownDeadline && std::chrono::steady_clock::now() >= *state.shutdownDeadline;
+}
+
+auto UplinkWorker::requestFitsShutdown(const RunState& state) const -> bool
+{
+	return !state.shutdownDeadline ||
+		std::chrono::steady_clock::now() + _configuration.requestTimeout <= *state.shutdownDeadline;
+}
+
+auto UplinkWorker::accountSuccess(std::vector<Record>& records) -> void
+{
+	if (records.empty())
+	{
+		return;
+	}
+	for (const auto& record : records)
+	{
+		_queue.release(record);
+	}
+	std::lock_guard lock(_statusMutex);
+	_status.connected = true;
+	_status.lastSuccessfulSendTime = TimePoint::clock::now();
+	for (const auto& record : records)
+	{
+		++_status.deliveredRecordsByProducer[record.producerId];
+	}
+	_status.deliveredRecords += records.size();
+}
+
+auto UplinkWorker::accountFailure(std::vector<Record>& records, int code, std::string message) -> void
+{
+	if (records.empty())
+	{
+		return;
+	}
+	for (const auto& record : records)
+	{
+		_queue.release(record);
+	}
+	std::lock_guard lock(_statusMutex);
+	_status.lastErrorCode = code;
+	_status.error = std::move(message);
+	_status.failedRecords += records.size();
+	for (const auto& record : records)
+	{
+		++_status.failedRecordsByProducer[record.producerId];
+		_status.lastErrorCodeByProducer[record.producerId] = code;
+	}
+}
+
+auto UplinkWorker::releaseUndelivered(RunState& state) -> void
+{
+	std::vector<Record> undelivered = std::move(state.pending);
+	state.pending.clear();
+	if (state.deferred)
+	{
+		undelivered.push_back(std::move(*state.deferred));
+		state.deferred.reset();
+	}
+	auto planned = state.planner.take();
+	undelivered.insert(undelivered.end(), std::make_move_iterator(planned.begin()), std::make_move_iterator(planned.end()));
+	while (auto record = _queue.tryPop())
+	{
+		undelivered.push_back(std::move(*record));
+	}
+	_inFlightRecords = 0;
+	accountFailure(undelivered, -1, "shutdown final flush released undelivered records");
+}
+
+auto UplinkWorker::admitRecord(RunState& state, Record record) -> bool
+{
+	if (state.planner.accepts(record))
+	{
+		if (!state.planner.push(std::move(record), std::chrono::steady_clock::now()))
+		{
+			throw std::logic_error("accepted record could not enter the batch planner");
+		}
+	}
+	else if (state.planner.empty())
+	{
+		std::vector<Record> oversized;
+		oversized.push_back(std::move(record));
+		accountFailure(oversized, 413, "record exceeds the configured batch limits");
+		setFailure(413, "record exceeds the configured batch limits");
+		_inFlightRecords = state.deferred ? 1 : 0;
+		return false;
+	}
+	else
+	{
+		state.deferred = std::move(record);
+	}
+	_inFlightRecords = state.planner.size() + (state.deferred ? 1 : 0);
+	return true;
+}
+
+auto UplinkWorker::applyPartialResult(RunState& state, const UploadResult& result, int transientCode) -> bool
+{
+	{
+		std::lock_guard lock(_statusMutex);
+		_status.connected = true;
+	}
+	auto outcome = partitionPartialBatch(std::move(state.pending), result);
+	accountSuccess(outcome.succeeded);
+	for (auto& [record, failure] : outcome.permanent)
+	{
+		std::vector<Record> failed;
+		failed.push_back(std::move(record));
+		accountFailure(failed, failure.code, failure.message);
+	}
+	state.pending = std::move(outcome.retry);
+	{
+		std::lock_guard lock(_statusMutex);
+		for (const auto& record : state.pending)
+		{
+			_status.lastErrorCodeByProducer[record.producerId] = transientCode;
+		}
+	}
+	_inFlightRecords = state.pending.size() + (state.deferred ? 1 : 0);
+	return state.pending.empty();
+}
+
+auto UplinkWorker::sendWithRetry(ReductTransport& transport, RunState& state, bool& partialResolved)
+	-> std::optional<UploadResult>
+{
+	UploadResult result;
+	for (std::size_t attempt = 0; attempt < _configuration.retry.maxAttempts; ++attempt)
+	{
+		if (!requestFitsShutdown(state))
+		{
+			releaseUndelivered(state);
+			setFailure(-1, "shutdown final flush timed out before another HTTP request");
+			return std::nullopt;
+		}
+		result = transport.writeBatch(state.pending);
+		if (!result.delivered && !result.recordFailures.empty())
+		{
+			int transientCode = 0;
+			for (const auto& failure : result.recordFailures)
+			{
+				if (isRetryableError(failure.code))
+				{
+					transientCode = failure.code;
+				}
+			}
+			partialResolved = applyPartialResult(state, result, transientCode);
+			if (partialResolved)
+			{
+				return result;
+			}
+		}
+		if (result.delivered || !result.retryable || attempt + 1 == _configuration.retry.maxAttempts || !_running)
+		{
+			break;
+		}
+		const auto multiplier = std::int64_t { 1 } << attempt;
+		const auto delay = std::min(_configuration.retry.maximumBackoff, _configuration.retry.initialBackoff * multiplier);
+		waitWhileRunning(delay);
+	}
+	return result;
+}
+
+auto UplinkWorker::finishBatch(RunState& state, const UploadResult& result, bool partialResolved) -> void
+{
+	if (result.delivered)
+	{
+		accountSuccess(state.pending);
+		{
+			std::lock_guard lock(_statusMutex);
+			_status.error.clear();
+			_status.lastErrorCode = 0;
+		}
+		state.pending.clear();
+	}
+	else if (!partialResolved)
+	{
+		if (!result.retryable)
+		{
+			accountFailure(state.pending, result.errorCode, result.error);
+			setFailure(result.errorCode, result.error);
+			state.pending.clear();
+		}
+		else
+		{
+			{
+				std::lock_guard lock(_statusMutex);
+				for (const auto& record : state.pending)
+				{
+					_status.lastErrorCodeByProducer[record.producerId] = result.errorCode;
+				}
+			}
+			setFailure(result.errorCode, result.error);
+		}
+	}
+	_inFlightRecords = state.pending.size() + (state.deferred ? 1 : 0);
+}
+
 auto UplinkWorker::run() -> void
 {
 	ReductTransport transport(_configuration);
-	BatchPlanner planner({
-		_configuration.maxBatchRecords,
-		_configuration.maxBatchPayloadBytes,
-		_configuration.maxBatchMetadataBytes,
-		_configuration.maxBatchAge,
-	});
-	std::vector<Record> pending;
-	std::optional<Record> deferred;
-	std::optional<std::chrono::steady_clock::time_point> shutdownDeadline;
-	auto releaseUndelivered = [this, &planner, &pending, &deferred] {
-		std::vector<std::uint64_t> producers;
-		auto collect = [&producers](const Record& record) { producers.push_back(record.producerId); };
-		for (const auto& record : pending)
-		{
-			_queue.release(record);
-			collect(record);
-		}
-		pending.clear();
-		if (deferred)
-		{
-			_queue.release(*deferred);
-			collect(*deferred);
-			deferred.reset();
-		}
-		for (const auto& record : planner.take())
-		{
-			_queue.release(record);
-			collect(record);
-		}
-		while (auto record = _queue.tryPop())
-		{
-			_queue.release(*record);
-			collect(*record);
-		}
-		_inFlightRecords = 0;
-		if (!producers.empty())
-		{
-			std::lock_guard lock(_statusMutex);
-			_status.failedRecords += producers.size();
-			_status.lastErrorCode = -1;
-			for (const auto producer : producers)
-			{
-				++_status.failedRecordsByProducer[producer];
-				_status.lastErrorCodeByProducer[producer] = -1;
-			}
-		}
-		return producers.size();
-	};
-	while (_running || !planner.empty() || _queue.size() != 0 || !pending.empty() || deferred)
+	RunState state(_configuration);
+	while (_running || !state.planner.empty() || _queue.size() != 0 || !state.pending.empty() || state.deferred)
 	{
-		if (!_running && !shutdownDeadline)
+		if (!_running && !state.shutdownDeadline)
 		{
-			shutdownDeadline = std::chrono::steady_clock::now() + _configuration.shutdownTimeout;
+			state.shutdownDeadline = std::chrono::steady_clock::now() + _configuration.shutdownTimeout;
 		}
-		if (shutdownDeadline && std::chrono::steady_clock::now() >= *shutdownDeadline)
+		if (shutdownExpired(state))
 		{
-			releaseUndelivered();
+			releaseUndelivered(state);
 			setFailure(-1, "shutdown final flush timed out with undelivered records");
 			return;
 		}
-		if (pending.empty())
+		if (state.pending.empty())
 		{
 			std::optional<Record> record;
-			if (deferred)
+			if (state.deferred)
 			{
-				record = std::move(deferred);
-				deferred.reset();
+				record = std::move(*state.deferred);
+				state.deferred.reset();
 			}
 			else
 			{
 				record = _queue.waitPop(std::chrono::milliseconds(50));
 			}
-			if (record)
-			{
-				if (planner.accepts(*record))
-				{
-					if (!planner.push(std::move(*record), std::chrono::steady_clock::now()))
-					{
-						throw std::logic_error("accepted record could not enter the batch planner");
-					}
-				}
-				else if (planner.empty())
-				{
-					_queue.release(*record);
-					{
-						std::lock_guard lock(_statusMutex);
-						++_status.failedRecords;
-						++_status.failedRecordsByProducer[record->producerId];
-						_status.lastErrorCode = 413;
-						_status.lastErrorCodeByProducer[record->producerId] = 413;
-					}
-					setFailure(413, "record exceeds the configured batch limits");
-					continue;
-				}
-				else
-				{
-					deferred = std::move(record);
-				}
-				_inFlightRecords = planner.size() + (deferred ? 1 : 0);
-			}
-			if (planner.empty())
+			if (record && !admitRecord(state, std::move(*record)))
 			{
 				continue;
 			}
-			if (!deferred && !planner.shouldFlush(std::chrono::steady_clock::now()) && _running)
+			if (state.planner.empty())
 			{
 				continue;
 			}
-			pending = planner.take();
-			_inFlightRecords = pending.size() + (deferred ? 1 : 0);
+			if (!state.deferred && !state.planner.shouldFlush(std::chrono::steady_clock::now()) && _running)
+			{
+				continue;
+			}
+			state.pending = state.planner.take();
+			_inFlightRecords = state.pending.size() + (state.deferred ? 1 : 0);
 		}
-		UploadResult result;
 		bool partialResolved = false;
-		for (std::size_t attempt = 0; attempt < _configuration.retry.maxAttempts; ++attempt)
+		auto result = sendWithRetry(transport, state, partialResolved);
+		if (!result)
 		{
-			if (shutdownDeadline && std::chrono::steady_clock::now() + _configuration.requestTimeout > *shutdownDeadline)
-			{
-				releaseUndelivered();
-				setFailure(-1, "shutdown final flush timed out before another HTTP request");
-				return;
-			}
-			result = transport.writeBatch(pending);
-			if (!result.delivered && !result.recordFailures.empty())
-			{
-				int transientCode = 0;
-				for (const auto& failure : result.recordFailures)
-				{
-					if (isRetryableError(failure.code))
-					{
-						transientCode = failure.code;
-					}
-				}
-				auto outcome = partitionPartialBatch(std::move(pending), result);
-				std::lock_guard lock(_statusMutex);
-				_status.connected = true;
-				for (auto& record : outcome.succeeded)
-				{
-					_queue.release(record);
-					++_status.deliveredRecords;
-					++_status.deliveredRecordsByProducer[record.producerId];
-					_status.lastSuccessfulSendTime = TimePoint::clock::now();
-				}
-				for (auto& [record, failure] : outcome.permanent)
-				{
-					_queue.release(record);
-					++_status.failedRecords;
-					++_status.failedRecordsByProducer[record.producerId];
-					_status.lastErrorCode = failure.code;
-					_status.lastErrorCodeByProducer[record.producerId] = failure.code;
-					_status.error = failure.message;
-				}
-				pending = std::move(outcome.retry);
-				for (const auto& record : pending)
-				{
-					_status.lastErrorCodeByProducer[record.producerId] = transientCode;
-				}
-				_inFlightRecords = pending.size() + (deferred ? 1 : 0);
-				if (pending.empty())
-				{
-					partialResolved = true;
-					break;
-				}
-			}
-			if (result.delivered || !result.retryable || attempt + 1 == _configuration.retry.maxAttempts || !_running)
-			{
-				break;
-			}
-			const auto multiplier = std::int64_t { 1 } << attempt;
-			const auto delay = std::min(_configuration.retry.maximumBackoff, _configuration.retry.initialBackoff * multiplier);
-			const auto retryAt = std::chrono::steady_clock::now() + delay;
-			while (_running && std::chrono::steady_clock::now() < retryAt)
-			{
-				std::this_thread::sleep_for(std::chrono::milliseconds(10));
-			}
+			return;
 		}
-		if (result.delivered)
+		finishBatch(state, *result, partialResolved);
+		if (result->retryable && !state.pending.empty())
 		{
-			for (const auto& record : pending)
-			{
-				_queue.release(record);
-			}
-			std::lock_guard lock(_statusMutex);
-			_status.connected = true;
-			_status.error.clear();
-			_status.lastErrorCode = 0;
-			for (const auto& record : pending)
-			{
-				++_status.deliveredRecordsByProducer[record.producerId];
-			}
-			_status.deliveredRecords += pending.size();
-			_status.lastSuccessfulSendTime = TimePoint::clock::now();
-			pending.clear();
-			_inFlightRecords = deferred ? 1 : 0;
-			continue;
-		}
-		if (partialResolved)
-		{
-			continue;
-		}
-		if (!result.retryable)
-		{
-			for (const auto& record : pending)
-			{
-				_queue.release(record);
-			}
-			{
-				std::lock_guard lock(_statusMutex);
-				_status.failedRecords += pending.size();
-				for (const auto& record : pending)
-				{
-					++_status.failedRecordsByProducer[record.producerId];
-					_status.lastErrorCodeByProducer[record.producerId] = result.errorCode;
-				}
-			}
-			pending.clear();
-			_inFlightRecords = deferred ? 1 : 0;
-			setFailure(result.errorCode, result.error);
-			continue;
-		}
-		{
-			std::lock_guard lock(_statusMutex);
-			for (const auto& record : pending)
-			{
-				_status.lastErrorCodeByProducer[record.producerId] = result.errorCode;
-			}
-		}
-		setFailure(result.errorCode, result.error);
-		const auto retryAt = std::chrono::steady_clock::now() + _configuration.retry.maximumBackoff;
-		while (_running && std::chrono::steady_clock::now() < retryAt)
-		{
-			std::this_thread::sleep_for(std::chrono::milliseconds(10));
+			waitWhileRunning(_configuration.retry.maximumBackoff);
 		}
 	}
 }

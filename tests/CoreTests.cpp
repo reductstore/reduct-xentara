@@ -221,8 +221,8 @@ void attributesQueueRejectionToProducer()
 	ClientConfiguration configuration;
 	configuration.maxQueueBytes = record.storageBytes();
 	UplinkWorker worker(configuration);
-	check(worker.enqueue(record).accepted, "the first producer record must fit");
-	check(!worker.enqueue(Record { "b", {}, "application/json", "1", {}, 9 }).accepted,
+	check(worker.enqueue(record), "the first producer record must fit");
+	check(!worker.enqueue(Record { "b", {}, "application/json", "1", {}, 9 }),
 		"a full queue must reject the next producer record");
 	const auto status = worker.status();
 	check(status.rejectedRecordsByProducer.at(9) == 1, "queue rejection must be attributed to its producer");
@@ -250,8 +250,8 @@ void attributesQueueDropToProducer()
 	configuration.maxQueueBytes = first.storageBytes();
 	configuration.overflowPolicy = OverflowPolicy::DropOldest;
 	UplinkWorker worker(configuration);
-	check(worker.enqueue(first).accepted, "the first producer record must fit");
-	check(worker.enqueue(Record { "b", {}, "application/json", "1234", {}, 9 }).accepted,
+	check(worker.enqueue(first), "the first producer record must fit");
+	check(worker.enqueue(Record { "b", {}, "application/json", "1234", {}, 9 }),
 		"drop-oldest policy must accept the replacement record");
 	const auto status = worker.status();
 	check(status.droppedRecordsByProducer.at(7) == 1, "queue drop must be attributed to the discarded producer");
@@ -317,7 +317,7 @@ void releasesPendingRecordsOnShutdown()
 	configuration.bucket = "test";
 	UplinkWorker worker(configuration);
 	worker.start();
-	check(worker.enqueue(Record { "entry", TimePoint::clock::now(), "application/json", "1", {}, 42 }).accepted, "the record must enter the worker queue");
+	check(worker.enqueue(Record { "entry", TimePoint::clock::now(), "application/json", "1", {}, 42 }), "the record must enter the worker queue");
 	const auto started = std::chrono::steady_clock::now();
 	worker.stop();
 	check(std::chrono::steady_clock::now() - started < std::chrono::seconds(14),

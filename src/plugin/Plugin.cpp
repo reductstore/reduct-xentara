@@ -37,22 +37,23 @@ using namespace xentara::literals;
 
 std::atomic_uint64_t nextProducerId { 1 };
 
-const model::Attribute kHealthy { "98915e48-f6d9-4954-9d33-e91ffca468f9"_uuid, "healthy"sv, model::Attribute::Access::ReadOnly, data::DataType::kBoolean };
+const model::Attribute kConnected { "8f4d2a71-6b35-4c98-9d0a-2d5f7c1e8a44"_uuid, "connected"sv, model::Attribute::Access::ReadOnly, data::DataType::kBoolean };
 const model::Attribute kQueuedRecords { "fe3d61a2-8720-4ce7-948a-bf22ad5dbb1f"_uuid, "queuedRecords"sv, model::Attribute::Access::ReadOnly, data::DataType::kInteger };
 const model::Attribute kInFlightRecords { "d6c7c05a-9a7e-48b2-9aa8-faf9a339dbb1"_uuid, "inFlightRecords"sv, model::Attribute::Access::ReadOnly, data::DataType::kInteger };
 const model::Attribute kQueuedBytes { "b6350cac-b1ae-44a4-b5ef-5b4d2fb5c2d5"_uuid, "queuedBytes"sv, model::Attribute::Access::ReadOnly, data::DataType::kInteger };
+const model::Attribute kDeliveredRecords { "5aa1c93e-3d84-4f2b-9c17-0e6b8a4d2f70"_uuid, "deliveredRecords"sv, model::Attribute::Access::ReadOnly, data::DataType::kInteger };
+const model::Attribute kFailedRecords { "55c99df4-78e5-4c6a-9d93-870d71a67b5a"_uuid, "failedRecords"sv, model::Attribute::Access::ReadOnly, data::DataType::kInteger };
 const model::Attribute kRejectedRecords { "a065417d-5e59-4db7-9707-7d03e1f9af17"_uuid, "rejectedRecords"sv, model::Attribute::Access::ReadOnly, data::DataType::kInteger };
 const model::Attribute kDroppedRecords { "a55ee685-69e2-4e9d-b889-64c64eeb6024"_uuid, "droppedRecords"sv, model::Attribute::Access::ReadOnly, data::DataType::kInteger };
-const model::Attribute kFailedRecords { "55c99df4-78e5-4c6a-9d93-870d71a67b5a"_uuid, "failedRecords"sv, model::Attribute::Access::ReadOnly, data::DataType::kInteger };
 const model::Attribute kCollectionFailures { "461a7d30-ec81-41d9-b630-6187eeef6d3d"_uuid, "collectionFailures"sv, model::Attribute::Access::ReadOnly, data::DataType::kInteger };
 const model::Attribute kDuplicateSnapshots { "bbdb44e0-f343-4fd1-b1f9-9e5ab4c62209"_uuid, "duplicateSnapshots"sv, model::Attribute::Access::ReadOnly, data::DataType::kInteger };
 const model::Attribute kLastErrorCode { "3471b8be-11a7-4c0a-9e7e-cbbde003ab19"_uuid, "lastErrorCode"sv, model::Attribute::Access::ReadOnly, data::DataType::kInteger };
 const model::Attribute kLastSuccessfulSendTime { "b33cac6d-19b0-4fc5-b8b9-1c8abcf57cf0"_uuid, "lastSuccessfulSendTime"sv, model::Attribute::Access::ReadOnly, data::DataType::kTimeStamp };
+const model::Attribute kHealthy { "98915e48-f6d9-4954-9d33-e91ffca468f9"_uuid, "healthy"sv, model::Attribute::Access::ReadOnly, data::DataType::kBoolean };
 const model::Attribute kError { model::Attribute::kError, model::Attribute::Access::ReadOnly, data::DataType::kErrorCode };
 const process::Event::Role kSent { "c0d111f6-2f1b-497a-bcaf-837c6f56add6"_uuid, "sent"sv };
 const process::Event::Role kSendError { "d0bee531-3595-466f-96bd-6f7dcc0ad09f"_uuid, "sendError"sv };
 const process::Task::Role kCollect { "6c1c2987-3b97-450e-8614-ca00a9a15587"_uuid, "collect"sv };
-const process::Task::Role kSend { "b590c276-adf7-4d28-875f-0946b0c93a26"_uuid, "send"sv };
 
 auto parseOverflowPolicy(utils::json::decoder::Value& value) -> reductstore_xentara::OverflowPolicy
 {
@@ -103,6 +104,27 @@ auto ReductClient::createChildElement(const skill::Element::Class& elementClass,
 		return factory.makeShared<ReductWriter>(*this);
 	}
 	return nullptr;
+}
+
+auto ReductClient::forEachAttribute(const model::ForEachAttributeFunction& function) const -> bool
+{
+	return function(kConnected) || function(kQueuedRecords) || function(kInFlightRecords) || function(kQueuedBytes) ||
+		function(kDeliveredRecords) || function(kFailedRecords) || function(kLastErrorCode) ||
+		function(kLastSuccessfulSendTime) || function(kError);
+}
+
+auto ReductClient::makeReadHandle(const model::Attribute& attribute) const noexcept -> std::optional<data::ReadHandle>
+{
+	if (attribute == kConnected) return _state.member(&State::connected);
+	if (attribute == kQueuedRecords) return _state.member(&State::queuedRecords);
+	if (attribute == kInFlightRecords) return _state.member(&State::inFlightRecords);
+	if (attribute == kQueuedBytes) return _state.member(&State::queuedBytes);
+	if (attribute == kDeliveredRecords) return _state.member(&State::deliveredRecords);
+	if (attribute == kFailedRecords) return _state.member(&State::failedRecords);
+	if (attribute == kLastErrorCode) return _state.member(&State::lastErrorCode);
+	if (attribute == kLastSuccessfulSendTime) return _state.member(&State::lastSuccessfulSendTime);
+	if (attribute == kError) return _state.member(&State::error);
+	return std::nullopt;
 }
 
 auto ReductClient::category() const noexcept -> model::ElementCategory
@@ -162,6 +184,11 @@ auto ReductClient::load(utils::json::decoder::Object& object, config::Context&) 
 	}
 }
 
+auto ReductClient::realize() -> void
+{
+	_state.create(memory::memoryResources::data());
+}
+
 auto ReductClient::prepare() -> void
 {
 	if (!_entryPrefix.empty() && !isRelativeEntry(_entryPrefix))
@@ -174,6 +201,7 @@ auto ReductClient::prepare() -> void
 	}
 	_worker = std::make_unique<reductstore_xentara::UplinkWorker>(_configuration);
 	_worker->start();
+	updateStatus();
 }
 
 auto ReductClient::cleanup() -> void
@@ -184,19 +212,43 @@ auto ReductClient::cleanup() -> void
 	}
 }
 
+auto ReductClient::updateStatus() -> void
+{
+	if (!_worker)
+	{
+		return;
+	}
+	const auto status = _worker->status();
+	std::lock_guard lock(_stateMutex);
+	memory::WriteSentinel sentinel { _state };
+	auto& state = *sentinel;
+	state.connected = status.connected;
+	state.queuedRecords = status.queuedRecords;
+	state.inFlightRecords = status.inFlightRecords;
+	state.queuedBytes = status.queuedBytes;
+	state.deliveredRecords = status.deliveredRecords;
+	state.failedRecords = status.failedRecords;
+	state.lastErrorCode = status.lastErrorCode;
+	state.error = status.error.empty() ? std::error_code {} : std::make_error_code(std::errc::io_error);
+	state.lastSuccessfulSendTime = status.lastSuccessfulSendTime;
+	const auto timestamp = status.lastSuccessfulSendTime == reductstore_xentara::TimePoint::min()
+		? std::chrono::system_clock::now()
+		: status.lastSuccessfulSendTime;
+	sentinel.commit(timestamp);
+}
+
 ReductWriter::ReductWriter(std::reference_wrapper<ReductClient> client) :
 	_client(client),
 	_producerId(nextProducerId.fetch_add(1)),
-	_collectTask(*this),
-	_sendTask(*this)
+	_collectTask(*this)
 {
 }
 
 auto ReductWriter::forEachAttribute(const model::ForEachAttributeFunction& function) const -> bool
 {
-	return function(kHealthy) || function(kQueuedRecords) || function(kInFlightRecords) || function(kQueuedBytes) || function(kRejectedRecords) ||
+	return function(kHealthy) || function(kDeliveredRecords) || function(kRejectedRecords) ||
 		function(kDroppedRecords) || function(kFailedRecords) || function(kCollectionFailures) ||
-		function(kDuplicateSnapshots) || function(kLastErrorCode) || function(kLastSuccessfulSendTime) || function(kError);
+		function(kDuplicateSnapshots) || function(kLastErrorCode) || function(kError);
 }
 
 auto ReductWriter::forEachEvent(const model::ForEachEventFunction& function) -> bool
@@ -206,22 +258,19 @@ auto ReductWriter::forEachEvent(const model::ForEachEventFunction& function) -> 
 
 auto ReductWriter::forEachTask(const model::ForEachTaskFunction& function) -> bool
 {
-	return function(kCollect, sharedFromThis(&_collectTask)) || function(kSend, sharedFromThis(&_sendTask));
+	return function(kCollect, sharedFromThis(&_collectTask));
 }
 
 auto ReductWriter::makeReadHandle(const model::Attribute& attribute) const noexcept -> std::optional<data::ReadHandle>
 {
 	if (attribute == kHealthy) return _state.member(&State::healthy);
-	if (attribute == kQueuedRecords) return _state.member(&State::queuedRecords);
-	if (attribute == kInFlightRecords) return _state.member(&State::inFlightRecords);
-	if (attribute == kQueuedBytes) return _state.member(&State::queuedBytes);
+	if (attribute == kDeliveredRecords) return _state.member(&State::deliveredRecords);
 	if (attribute == kRejectedRecords) return _state.member(&State::rejectedRecords);
 	if (attribute == kDroppedRecords) return _state.member(&State::droppedRecords);
 	if (attribute == kFailedRecords) return _state.member(&State::failedRecords);
 	if (attribute == kCollectionFailures) return _state.member(&State::collectionFailures);
 	if (attribute == kDuplicateSnapshots) return _state.member(&State::duplicateSnapshots);
 	if (attribute == kLastErrorCode) return _state.member(&State::lastErrorCode);
-	if (attribute == kLastSuccessfulSendTime) return _state.member(&State::lastSuccessfulSendTime);
 	if (attribute == kError) return _state.member(&State::error);
 	return std::nullopt;
 }
@@ -434,10 +483,8 @@ auto ReductWriter::collect(const process::ExecutionContext& context) -> void
 				}
 				result.record->producerId = _producerId;
 				const auto recordTimestamp = result.record->timestamp;
-				const auto enqueue = _client.get().worker().enqueue(std::move(*result.record));
-				if (!enqueue.accepted)
+				if (!_client.get().worker().enqueue(std::move(*result.record)))
 				{
-					++_collectionFailures;
 					continue;
 				}
 				snapshot.lastTimestamp = recordTimestamp;
@@ -451,9 +498,9 @@ auto ReductWriter::collect(const process::ExecutionContext& context) -> void
 	updateState(context.scheduledTime());
 }
 
-
 auto ReductWriter::updateState(std::chrono::system_clock::time_point timestamp) -> void
 {
+	_client.get().updateStatus();
 	std::lock_guard lock(_mutex);
 	const auto status = _client.get().worker().status();
 	const auto delivered = status.deliveredRecordsByProducer.find(_producerId);
@@ -469,25 +516,29 @@ auto ReductWriter::updateState(std::chrono::system_clock::time_point timestamp) 
 	const auto deliveryFailures = failedRecords + rejectedRecords + droppedRecords;
 	const auto collectionFailed = _collectionFailures != _observedCollectionFailures;
 	const auto deliveryFailed = deliveryFailures != _observedDeliveryFailures;
-	const auto ownFailed = collectionFailed || deliveryFailed;
+	if (collectionFailed || deliveryFailed)
+	{
+		_failureActive = true;
+		_observedCollectionFailures = _collectionFailures;
+		_observedDeliveryFailures = deliveryFailures;
+	}
+	else if (deliveredRecords > _observedDelivered)
+	{
+		_failureActive = false;
+	}
 	memory::WriteSentinel sentinel { _state };
 	auto& state = *sentinel;
-	state.healthy = status.connected && !ownFailed;
-	state.queuedRecords = status.queuedRecords;
-	state.inFlightRecords = status.inFlightRecords;
-	state.queuedBytes = status.queuedBytes;
+	state.healthy = !_failureActive;
+	state.deliveredRecords = deliveredRecords;
 	state.rejectedRecords = rejectedRecords;
 	state.droppedRecords = droppedRecords;
 	state.failedRecords = failedRecords;
 	state.collectionFailures = _collectionFailures;
 	state.duplicateSnapshots = _duplicateSnapshots;
 	state.lastErrorCode = lastErrorCode;
-	state.error = ownFailed ? std::make_error_code(std::errc::io_error) : std::error_code {};
-	state.lastSuccessfulSendTime = status.lastSuccessfulSendTime;
-	if (ownFailed)
+	state.error = _failureActive ? std::make_error_code(std::errc::io_error) : std::error_code {};
+	if (collectionFailed || deliveryFailed)
 	{
-		_observedCollectionFailures = _collectionFailures;
-		_observedDeliveryFailures = deliveryFailures;
 		sentinel.commit(timestamp, _error);
 	}
 	else if (deliveredRecords > _observedDelivered)
@@ -503,9 +554,5 @@ auto ReductWriter::updateState(std::chrono::system_clock::time_point timestamp) 
 
 ReductWriter::CollectTask::CollectTask(ReductWriter& target) : _target(target) {}
 auto ReductWriter::CollectTask::operational(const process::ExecutionContext& context) -> void { _target.get().collect(context); }
-ReductWriter::SendTask::SendTask(ReductWriter& target) : _target(target) {}
-auto ReductWriter::SendTask::stages() const -> Stages { return Stage::Operational | Stage::PostOperational; }
-auto ReductWriter::SendTask::operational(const process::ExecutionContext& context) -> void { _target.get().updateState(context.scheduledTime()); }
-auto ReductWriter::SendTask::preparePostOperational(const process::ExecutionContext& context) -> Status { _target.get().updateState(context.scheduledTime()); return Status::Completed; }
 
 }
