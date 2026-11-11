@@ -54,6 +54,29 @@ void rejectsInvalidConfiguration()
 		"default shutdown time must allow at least one final HTTP request");
 }
 
+void boundsRetryBackoffForLargeAttemptCounts()
+{
+	RetryPolicy bounded;
+	bounded.initialBackoff = std::chrono::milliseconds(1);
+	bounded.maximumBackoff = std::chrono::milliseconds(120);
+	check(bounded.delayForAttempt(0) == std::chrono::milliseconds(1), "the first retry delay must use the initial backoff");
+	check(bounded.delayForAttempt(6) == std::chrono::milliseconds(64), "retry delay must double while below the cap");
+	check(bounded.delayForAttempt(std::numeric_limits<std::size_t>::max()) == bounded.maximumBackoff,
+		"retry delay must cap without overflowing for large attempt counts");
+
+	RetryPolicy zero;
+	zero.initialBackoff = std::chrono::milliseconds::zero();
+	zero.maximumBackoff = std::chrono::milliseconds(120);
+	check(zero.delayForAttempt(std::numeric_limits<std::size_t>::max()) == std::chrono::milliseconds::zero(),
+		"zero retry backoff must remain bounded for large attempt counts");
+
+	RetryPolicy largest;
+	largest.initialBackoff = std::chrono::milliseconds(1);
+	largest.maximumBackoff = std::chrono::milliseconds::max();
+	check(largest.delayForAttempt(std::numeric_limits<std::size_t>::max()) == largest.maximumBackoff,
+		"retry delay must saturate when the configured cap is the largest duration");
+}
+
 void namespacesEntriesWithoutMandatoryPrefix()
 {
 	check(entryName({}, "telemetry") == "telemetry", "an empty prefix must preserve a complete entry path");
@@ -227,6 +250,7 @@ void attributesQueueRejectionToProducer()
 	const auto status = worker.status();
 	check(status.rejectedRecordsByProducer.at(9) == 1, "queue rejection must be attributed to its producer");
 	check(status.failedRecordsByProducer.at(9) == 1, "queue rejection must be counted as a producer delivery failure");
+	check(status.failedRecords == 1, "queue rejection must not be counted twice globally");
 }
 
 void dropsOldestRecordWhenConfigured()
@@ -256,6 +280,7 @@ void attributesQueueDropToProducer()
 	const auto status = worker.status();
 	check(status.droppedRecordsByProducer.at(7) == 1, "queue drop must be attributed to the discarded producer");
 	check(status.failedRecordsByProducer.at(7) == 1, "queue drop must count as a producer delivery failure");
+	check(status.failedRecords == 1, "queue drop must not be counted twice globally");
 }
 void rejectsEntireBatchWhenDuplicateIdentitiesExist()
 {
@@ -334,6 +359,7 @@ int main()
 {
 	const std::vector<std::pair<std::string, std::function<void()>>> tests {
 		{ "rejects invalid configuration", rejectsInvalidConfiguration },
+		{ "bounds retry backoff", boundsRetryBackoffForLargeAttemptCounts },
 		{ "namespaces optional entry prefixes", namespacesEntriesWithoutMandatoryPrefix },
 		{ "serializes numeric measurements", serializesNumericMeasurements },
 		{ "rejects non-finite measurements", rejectsNonFiniteMeasurementsWithoutSerialization },

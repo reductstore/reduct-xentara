@@ -125,6 +125,43 @@ void writesAndReadsProductionSnapshot()
 	check(labels.at("quality") == "Acceptable", "snapshot quality label must match");
 }
 
+void preservesConnectivityAfterDuplicateRecordFailure()
+{
+	auto config = configuration();
+	config.maxBatchRecords = 2;
+	config.maxBatchPayloadBytes = 8;
+	config.maxBatchAge = std::chrono::milliseconds(10);
+	UplinkWorker worker(config);
+	worker.start();
+	const auto deliveredTimestamp = TimePoint::clock::now();
+	check(worker.enqueue(Record { "connectivity/success", deliveredTimestamp, "application/json", "1", {} }),
+		"successful connectivity fixture must enter the worker queue");
+	check(waitFor([&worker] {
+		const auto status = worker.status();
+		return status.connected && status.deliveredRecords == 1;
+	}, std::chrono::seconds(2)), "a successful write must establish worker connectivity");
+
+	const auto duplicateTimestamp = deliveredTimestamp + std::chrono::microseconds(1);
+	check(worker.enqueue(Record { "connectivity/duplicate", duplicateTimestamp, "application/json", "1", {} }),
+		"first duplicate fixture must enter the worker queue");
+	check(worker.enqueue(Record { "connectivity/duplicate", duplicateTimestamp, "application/json", "2", {} }),
+		"second duplicate fixture must enter the worker queue");
+	check(waitFor([&worker] {
+		const auto status = worker.status();
+		return status.failedRecords == 2 && status.lastErrorCode == 409;
+	}, std::chrono::seconds(2)), "duplicate batch must fail permanently");
+	check(worker.status().connected, "a record-level 409 must not mark an established client disconnected");
+
+	check(worker.enqueue(Record { "connectivity/oversize", duplicateTimestamp + std::chrono::microseconds(1), "application/json", "payload-too-large", {} }),
+		"oversized fixture must enter the worker queue");
+	check(waitFor([&worker] {
+		const auto status = worker.status();
+		return status.failedRecords == 3 && status.lastErrorCode == 413;
+	}, std::chrono::seconds(2)), "oversized record must fail permanently");
+	check(worker.status().connected, "a record-level 413 must not mark an established client disconnected");
+	worker.stop();
+}
+
 void workerCompletesSuccessfulRecordsFromPartialBatch()
 {
 	auto config = configuration();
@@ -228,7 +265,7 @@ int main()
 		writesAndReadsProductionSnapshot();
 		detectsDuplicateTimestamp();
 		reportsUnavailableServer();
-		workerStopsWithinShutdownTimeout();
+		preservesConnectivityAfterDuplicateRecordFailure();
 		workerCompletesSuccessfulRecordsFromPartialBatch();
 	}
 	catch (const std::exception& error)

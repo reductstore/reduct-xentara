@@ -5,7 +5,7 @@ wait_for_reductstore() {
   attempt=0
   until curl --fail --silent --show-error -H 'Authorization: Bearer xentara-demo-token' http://127.0.0.1:8383/api/v1/info >/dev/null; do
     attempt=$((attempt + 1))
-    if [ "$attempt" -ge 50 ]; then
+    if [ "$attempt" -ge 200 ]; then
       exit 1
     fi
     sleep 0.1

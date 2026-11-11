@@ -19,6 +19,8 @@ struct RetryPolicy
 	std::size_t maxAttempts { 3 };
 	std::chrono::milliseconds initialBackoff { 100 };
 	std::chrono::milliseconds maximumBackoff { 2000 };
+
+	[[nodiscard]] auto delayForAttempt(std::size_t attempt) const noexcept -> std::chrono::milliseconds;
 };
 
 struct ClientConfiguration

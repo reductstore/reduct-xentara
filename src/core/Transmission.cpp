@@ -234,7 +234,10 @@ auto UplinkWorker::status() const -> DeliveryStatus
 auto UplinkWorker::setFailure(int code, std::string error) -> void
 {
 	std::lock_guard lock(_statusMutex);
-	_status.connected = false;
+	if (code < 0)
+	{
+		_status.connected = false;
+	}
 	_status.lastErrorCode = code;
 	_status.error = std::move(error);
 }
@@ -404,8 +407,7 @@ auto UplinkWorker::sendWithRetry(ReductTransport& transport, RunState& state, bo
 		{
 			break;
 		}
-		const auto multiplier = std::int64_t { 1 } << attempt;
-		const auto delay = std::min(_configuration.retry.maximumBackoff, _configuration.retry.initialBackoff * multiplier);
+		const auto delay = _configuration.retry.delayForAttempt(attempt);
 		waitWhileRunning(delay);
 	}
 	return result;

@@ -151,6 +151,7 @@ private:
 	memory::ObjectBlock<State> _state;
 	std::mutex _mutex;
 	bool _failureActive { false };
+	std::size_t _deliveredAtLastFailure { 0 };
 	std::size_t _observedDelivered { 0 };
 	std::size_t _collectionFailures { 0 };
 	std::size_t _observedCollectionFailures { 0 };

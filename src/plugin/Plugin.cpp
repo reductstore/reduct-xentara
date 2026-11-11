@@ -231,10 +231,7 @@ auto ReductClient::updateStatus() -> void
 	state.lastErrorCode = status.lastErrorCode;
 	state.error = status.error.empty() ? std::error_code {} : std::make_error_code(std::errc::io_error);
 	state.lastSuccessfulSendTime = status.lastSuccessfulSendTime;
-	const auto timestamp = status.lastSuccessfulSendTime == reductstore_xentara::TimePoint::min()
-		? std::chrono::system_clock::now()
-		: status.lastSuccessfulSendTime;
-	sentinel.commit(timestamp);
+	sentinel.commit(std::chrono::system_clock::now());
 }
 
 ReductWriter::ReductWriter(std::reference_wrapper<ReductClient> client) :
@@ -513,18 +510,24 @@ auto ReductWriter::updateState(std::chrono::system_clock::time_point timestamp) 
 	const auto droppedRecords = dropped == status.droppedRecordsByProducer.end() ? 0 : dropped->second;
 	const auto lastError = status.lastErrorCodeByProducer.find(_producerId);
 	const auto lastErrorCode = lastError == status.lastErrorCodeByProducer.end() ? 0 : lastError->second;
-	const auto deliveryFailures = failedRecords + rejectedRecords + droppedRecords;
+	const auto deliveryFailures = failedRecords;
 	const auto collectionFailed = _collectionFailures != _observedCollectionFailures;
 	const auto deliveryFailed = deliveryFailures != _observedDeliveryFailures;
+	const auto newDelivery = deliveredRecords > _observedDelivered;
 	if (collectionFailed || deliveryFailed)
 	{
 		_failureActive = true;
+		_deliveredAtLastFailure = deliveredRecords;
 		_observedCollectionFailures = _collectionFailures;
 		_observedDeliveryFailures = deliveryFailures;
 	}
-	else if (deliveredRecords > _observedDelivered)
+	else if (_failureActive && deliveredRecords > _deliveredAtLastFailure)
 	{
 		_failureActive = false;
+	}
+	if (newDelivery)
+	{
+		_observedDelivered = deliveredRecords;
 	}
 	memory::WriteSentinel sentinel { _state };
 	auto& state = *sentinel;
@@ -541,9 +544,8 @@ auto ReductWriter::updateState(std::chrono::system_clock::time_point timestamp) 
 	{
 		sentinel.commit(timestamp, _error);
 	}
-	else if (deliveredRecords > _observedDelivered)
+	else if (newDelivery)
 	{
-		_observedDelivered = deliveredRecords;
 		sentinel.commit(timestamp, _sent);
 	}
 	else

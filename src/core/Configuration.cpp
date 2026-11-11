@@ -3,6 +3,24 @@
 namespace reductstore_xentara
 {
 
+auto RetryPolicy::delayForAttempt(std::size_t attempt) const noexcept -> std::chrono::milliseconds
+{
+	if (initialBackoff.count() == 0 || initialBackoff >= maximumBackoff)
+	{
+		return initialBackoff;
+	}
+	auto delay = initialBackoff;
+	for (std::size_t index = 0; index < attempt && delay < maximumBackoff; ++index)
+	{
+		if (delay.count() > maximumBackoff.count() / 2)
+		{
+			return maximumBackoff;
+		}
+		delay *= 2;
+	}
+	return delay;
+}
+
 auto validate(const ClientConfiguration& configuration) -> std::string
 {
 	if (!configuration.serverUrl.starts_with("http://") && !configuration.serverUrl.starts_with("https://"))
