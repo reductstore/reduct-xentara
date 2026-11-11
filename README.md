@@ -75,8 +75,6 @@ See [`examples/model.json`](examples/model.json) for a complete model.
 
 The demo needs a [Xentara license with the ReductStore skill](https://xentara.io/licensing/).
 
-`docker compose` starts only the local ReductStore server. Build the plugin first with the commands above. Xentara reads its license from `/usr/local/share/xentara/licence/licences.json`; install the signed license there without adding it to this repository.
-
 ```sh
 docker compose -f examples/compose.yaml up -d
 xentara --plugin build/reductstore-xentara.json --model examples/model.json
