@@ -47,7 +47,7 @@ Payload version 1 has `measurements` and `quality` objects, plus an optional `so
 
 Snapshot record timestamps are normalized to ReductStore microseconds before duplicate detection and delivery. Record identity is `entry + timestamp`. Every snapshot either contains all configured values and qualities or is skipped. Source times are read after values and are best effort, so they are optional rather than a point-in-time atomic read. Record groups in one writer require distinct entries. If a submitted batch contains duplicate identities, the entire batch is rejected with 409 before any record is sent. Multi-device deployments must give each device a stable unique entry prefix because labels do not affect ReductStore record identity.
 
-Collection reads, serializes, enqueues, and updates status; a background worker performs all HTTP I/O. The worker enforces batch limits before admission. A record larger than a configured batch limit is rejected and reported. With `dropOldest`, the queue first verifies that dropping queued records can free enough memory; otherwise the new record is rejected without discarding anything. A writer becomes healthy again after its next successful delivery. `sent` and `sendError` events use only that writer's own failures.
+Collection reads, serializes, enqueues, and updates status; a background worker performs all HTTP I/O. The worker enforces batch limits before admission. A record larger than a configured batch limit is rejected and reported. With `dropOldest`, the queue first verifies that dropping queued records can free enough memory; otherwise the new record is rejected without discarding anything. A writer becomes healthy again after its next successful delivery. Each collection update raises `sent` for newly delivered records and `sendError` for new collection or delivery failures, at most once each; both are raised atomically when they occur together. Collection failures preserve system error codes, including the code carried by a thrown `std::system_error`.
 
 The worker preserves SDK error codes. It retries transport failures, 408, 429, and 5xx responses. `retry.maxAttempts` bounds one retry cycle; queued transient failures continue with bounded backoff until delivery, a permanent response, or shutdown. Per-record results are partitioned before retrying: confirmed records are released, transient per-record errors retry only their own records, and permanent per-record errors are released and counted without blocking later uploads. A retry that later reports an immutable-record conflict is never counted as delivered. Shutdown allows final requests only while the remaining `shutdownTimeout` can accommodate `requestTimeout`; it releases remaining records as failed and attributes those failures and error codes to their writers. Process crashes, overflow, and final-flush expiry can lose in-memory records and are exposed through attributes and events.
 
@@ -66,13 +66,15 @@ The model writes a 500 ms snapshot of Pulse, Sine, Triangle, Saw-Tooth, Inverted
 
 ```sh
 curl -H 'Authorization: Bearer xentara-demo-token' http://127.0.0.1:8383/api/v1/b/xentara-demo
-curl -H 'Authorization: Bearer xentara-demo-token' 'http://127.0.0.1:8383/api/v1/b/xentara-demo/a/xentara-demo/telemetry/snapshot'
+curl -H 'Authorization: Bearer xentara-demo-token' 'http://127.0.0.1:8383/api/v1/b/xentara-demo/xentara-demo/telemetry/snapshot?ts=<latest_record>'
 docker compose -f examples/compose.yaml down -v
 ```
 
 Enable integration tests with `-DREDUCTSTORE_XENTARA_ENABLE_INTEGRATION_TESTS=ON`, then run `ctest --test-dir build --output-on-failure` and `tests/integration-recovery.sh`. They cover batch admission limits, queue rejection and drop attribution, snapshot metadata, immutable timestamp conflicts, duplicate batch identities, per-record partial failures, unavailable-server retry, recovery of a queued record across a real server restart, and bounded shutdown.
 
-The installed runtime loads the plugin but rejects the model because its signed licence lacks the `ReductStore` skill entitlement. Direct SDK integration tests pass; six-signal Xentara execution remains blocked until embedded ocean issues that entitlement.
+With a signed `ReductStore` entitlement installed, run `tests/e2e-demo.sh` to validate model loading and a stored six-signal snapshot.
+
+A signed Xentara entitlement for the `ReductStore` skill is required to execute the demo model. Use the `latest_record` timestamp returned by the bucket request to read a snapshot.
 
 ## License
 

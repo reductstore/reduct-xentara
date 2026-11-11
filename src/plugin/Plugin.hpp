@@ -15,10 +15,12 @@
 #include <xentara/utils/core/Uuid.hpp>
 
 #include <atomic>
+#include <deque>
 #include <chrono>
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <system_error>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -116,11 +118,12 @@ private:
 		{
 			CollectionStatus status;
 			std::optional<reductstore_xentara::Record> record;
+			std::error_code error;
 		};
 
 		std::string entry;
 		reductstore_xentara::Labels labels;
-		std::vector<Measurement> measurements;
+		std::deque<Measurement> measurements;
 		std::optional<std::chrono::system_clock::time_point> lastTimestamp;
 
 		auto resolve() -> void;
@@ -141,10 +144,11 @@ private:
 	auto prepare() -> void final;
 	auto collect(const process::ExecutionContext& context) -> void;
 	auto updateState(std::chrono::system_clock::time_point timestamp) -> void;
+	auto recordCollectionFailure(std::error_code error) -> void;
 
 	std::reference_wrapper<ReductClient> _client;
 	std::uint64_t _producerId { 0 };
-	std::vector<Snapshot> _snapshots;
+	std::deque<Snapshot> _snapshots;
 	process::Event _sent;
 	process::Event _error;
 	CollectTask _collectTask;
@@ -157,6 +161,7 @@ private:
 	std::size_t _observedCollectionFailures { 0 };
 	std::size_t _observedDeliveryFailures { 0 };
 	std::size_t _duplicateSnapshots { 0 };
+	std::error_code _lastError;
 };
 
 class Skill final : public skill::Skill
@@ -168,7 +173,8 @@ private:
 	using Class = ConcreteClass<Skill,
 		"ReductStore",
 		"6c7a07de-c6e4-4bc6-8b2b-840d809e7f1d"_uuid,
-		ReductClient::Class>;
+		ReductClient::Class,
+		ReductWriter::Class>;
 	static Class _class;
 };
 

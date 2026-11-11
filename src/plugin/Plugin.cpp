@@ -15,10 +15,12 @@
 #include <xentara/model/ForEachAttributeFunction.hpp>
 #include <xentara/model/ForEachEventFunction.hpp>
 #include <xentara/model/ForEachTaskFunction.hpp>
+#include <xentara/process/EventList.hpp>
 #include <xentara/process/ExecutionContext.hpp>
 #include <xentara/skill/ElementFactory.hpp>
 #include <xentara/utils/json/decoder/Errors.hpp>
 #include <xentara/utils/json/decoder/Object.hpp>
+#include <xentara/utils/eh/currentErrorCode.hpp>
 
 #include <algorithm>
 #include <stdexcept>
@@ -341,7 +343,7 @@ auto ReductWriter::Snapshot::collect(std::chrono::system_clock::time_point sched
 		auto quality = measurement.quality.read<data::Quality>();
 		if (!value || !quality)
 		{
-			return { CollectionStatus::Incomplete, std::nullopt };
+			return { CollectionStatus::Incomplete, std::nullopt, std::make_error_code(std::errc::resource_unavailable_try_again) };
 		}
 		values.emplace_back(measurement.name, std::move(*value));
 		if (!measurement.sourceTimestamp.hardError())
@@ -386,7 +388,8 @@ auto ReductWriter::load(utils::json::decoder::Object& object, config::Context& c
 		{
 			for (auto&& item : value.asArray())
 			{
-				Snapshot snapshot;
+				_snapshots.emplace_back();
+				auto& snapshot = _snapshots.back();
 				bool modeLoaded = false;
 				bool entryLoaded = false;
 				bool timestampLoaded = false;
@@ -422,10 +425,10 @@ auto ReductWriter::load(utils::json::decoder::Object& object, config::Context& c
 						for (auto&& [measurementName, dataPoint] : groupValue.asObject())
 						{
 							if (measurementName.empty()) throw std::runtime_error("snapshot measurement names must be non-empty");
-							Measurement measurement;
+							snapshot.measurements.emplace_back();
+							auto& measurement = snapshot.measurements.back();
 							measurement.name = std::string(measurementName);
 							context.resolve<model::Element>(dataPoint, std::ref(measurement.dataPoint));
-							snapshot.measurements.push_back(std::move(measurement));
 						}
 					}
 					else config::throwUnknownParameterError(groupName);
@@ -434,11 +437,10 @@ auto ReductWriter::load(utils::json::decoder::Object& object, config::Context& c
 				{
 					throw std::runtime_error("each snapshot record group requires mode, relative entry, scheduled timestampSource, and measurements");
 				}
-				if (std::ranges::any_of(_snapshots, [&snapshot](const Snapshot& item) { return item.entry == snapshot.entry; }))
+				if (std::ranges::count(_snapshots, snapshot.entry, &Snapshot::entry) > 1)
 				{
 					throw std::runtime_error("snapshot record groups in one writer must use distinct entries");
 				}
-				_snapshots.push_back(std::move(snapshot));
 			}
 		}
 		else
@@ -459,6 +461,12 @@ auto ReductWriter::prepare() -> void
 	for (auto& snapshot : _snapshots) snapshot.resolve();
 }
 
+auto ReductWriter::recordCollectionFailure(std::error_code error) -> void
+{
+	++_collectionFailures;
+	_lastError = error ? error : std::make_error_code(std::errc::io_error);
+}
+
 auto ReductWriter::collect(const process::ExecutionContext& context) -> void
 {
 	{
@@ -470,7 +478,7 @@ auto ReductWriter::collect(const process::ExecutionContext& context) -> void
 				auto result = snapshot.collect(context.scheduledTime(), _client.get().host(), _client.get().entryPrefix());
 				if (result.status == Snapshot::CollectionStatus::Incomplete)
 				{
-					++_collectionFailures;
+					recordCollectionFailure(result.error);
 					continue;
 				}
 				if (result.status == Snapshot::CollectionStatus::Duplicate)
@@ -488,7 +496,7 @@ auto ReductWriter::collect(const process::ExecutionContext& context) -> void
 			}
 			catch (const std::exception&)
 			{
-				++_collectionFailures;
+				recordCollectionFailure(utils::eh::currentErrorCode());
 			}
 		}
 	}
@@ -514,16 +522,22 @@ auto ReductWriter::updateState(std::chrono::system_clock::time_point timestamp) 
 	const auto collectionFailed = _collectionFailures != _observedCollectionFailures;
 	const auto deliveryFailed = deliveryFailures != _observedDeliveryFailures;
 	const auto newDelivery = deliveredRecords > _observedDelivered;
-	if (collectionFailed || deliveryFailed)
+	const auto failureOccurred = collectionFailed || deliveryFailed;
+	if (failureOccurred)
 	{
 		_failureActive = true;
 		_deliveredAtLastFailure = deliveredRecords;
 		_observedCollectionFailures = _collectionFailures;
 		_observedDeliveryFailures = deliveryFailures;
+		if (deliveryFailed && !collectionFailed)
+		{
+			_lastError = std::make_error_code(std::errc::io_error);
+		}
 	}
 	else if (_failureActive && deliveredRecords > _deliveredAtLastFailure)
 	{
 		_failureActive = false;
+		_lastError.clear();
 	}
 	if (newDelivery)
 	{
@@ -538,20 +552,18 @@ auto ReductWriter::updateState(std::chrono::system_clock::time_point timestamp) 
 	state.failedRecords = failedRecords;
 	state.collectionFailures = _collectionFailures;
 	state.duplicateSnapshots = _duplicateSnapshots;
-	state.lastErrorCode = lastErrorCode;
-	state.error = _failureActive ? std::make_error_code(std::errc::io_error) : std::error_code {};
-	if (collectionFailed || deliveryFailed)
+	state.lastErrorCode = _failureActive ? _lastError.value() : lastErrorCode;
+	state.error = _failureActive ? _lastError : std::error_code {};
+	process::StaticEventList<2> events;
+	if (newDelivery)
 	{
-		sentinel.commit(timestamp, _error);
+		events.push_back(_sent);
 	}
-	else if (newDelivery)
+	if (failureOccurred)
 	{
-		sentinel.commit(timestamp, _sent);
+		events.push_back(_error);
 	}
-	else
-	{
-		sentinel.commit(timestamp);
-	}
+	sentinel.commit(timestamp, events);
 }
 
 ReductWriter::CollectTask::CollectTask(ReductWriter& target) : _target(target) {}
