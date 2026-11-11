@@ -73,25 +73,18 @@ See [`examples/model.json`](examples/model.json) for a complete model.
 
 ## Local demo
 
-The demo writes Pulse, Sine, Triangle, Saw-Tooth, Inverted Saw-Tooth, and Noise every 500 ms to `xentara-demo/telemetry/snapshot`.
+The demo needs a [Xentara license with the ReductStore skill](https://xentara.io/licensing/).
 
 ```sh
 docker compose -f examples/compose.yaml up -d
 xentara --plugin build/reductstore-xentara.json --model examples/model.json
 ```
 
-In another terminal:
+Open <http://127.0.0.1:8383> to see the `xentara-demo` bucket and its snapshots. The demo token is `xentara-demo-token`.
 
 ```sh
-curl -H 'Authorization: Bearer xentara-demo-token' \
-  http://127.0.0.1:8383/api/v1/b/xentara-demo
-# Copy info.latest_record from the response.
-curl -H 'Authorization: Bearer xentara-demo-token' \
-  'http://127.0.0.1:8383/api/v1/b/xentara-demo/xentara-demo/telemetry/snapshot?ts=<latest_record>' | jq
 docker compose -f examples/compose.yaml down -v
 ```
-
-ReductStore binds only to `127.0.0.1:8383`. The demo token is for local use only.
 
 ## Tests
 
