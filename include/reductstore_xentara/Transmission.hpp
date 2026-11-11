@@ -39,6 +39,15 @@ struct DeliveryStatus
 	int lastErrorCode { 0 };
 };
 
+struct PartialBatchOutcome
+{
+	std::vector<Record> retry;
+	std::vector<Record> succeeded;
+	std::vector<std::pair<Record, RecordFailure>> permanent;
+};
+
+[[nodiscard]] auto partitionPartialBatch(std::vector<Record> records, const UploadResult& result) -> PartialBatchOutcome;
+
 class ReductTransport final
 {
 public:

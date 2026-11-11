@@ -257,8 +257,7 @@ void attributesQueueDropToProducer()
 	check(status.droppedRecordsByProducer.at(7) == 1, "queue drop must be attributed to the discarded producer");
 	check(status.failedRecordsByProducer.at(7) == 1, "queue drop must count as a producer delivery failure");
 }
-
-void rejectsDuplicateBatchIdentitiesBeforeTransport()
+void rejectsEntireBatchWhenDuplicateIdentitiesExist()
 {
 	ClientConfiguration configuration;
 	configuration.serverUrl = "http://127.0.0.1:1";
@@ -268,14 +267,49 @@ void rejectsDuplicateBatchIdentitiesBeforeTransport()
 	const auto result = transport.writeBatch({
 		{ "duplicate", timestamp, "application/json", "1", {} },
 		{ "duplicate", timestamp, "application/json", "2", {} },
+		{ "valid", timestamp, "application/json", "3", {} },
 	});
-	check(!result.delivered, "duplicate batch identities must not be delivered");
-	check(result.recordFailures.size() == 2, "every duplicate batch record must be reported");
-	check(result.recordFailures.front().code == 409, "duplicate batch records must use the conflict status");
+	check(!result.delivered, "a batch containing duplicate identities must not be delivered");
+	check(result.errorCode == 409, "a rejected duplicate batch must report the conflict status");
+	check(result.recordFailures.empty(), "a rejected duplicate batch must not report individual partial failures");
 }
 
+void partitionsPartialBatchBeforeRetry()
+{
+	const auto timestamp = TimePoint::clock::now();
+	std::vector<Record> records {
+		{ "transient", timestamp, "application/json", "1", {}, 7 },
+		{ "permanent", timestamp, "application/json", "2", {}, 8 },
+		{ "success", timestamp, "application/json", "3", {}, 9 },
+	};
+	const auto result = UploadResult::partial({
+		{ { "transient", timestamp }, 503, "unavailable" },
+		{ { "permanent", timestamp }, 409, "already exists" },
+	});
+	const auto outcome = partitionPartialBatch(std::move(records), result);
+	check(outcome.retry.size() == 1 && outcome.retry.front().entry == "transient", "only transient per-record failures may retry");
+	check(outcome.succeeded.size() == 1 && outcome.succeeded.front().entry == "success", "successful records must be removed before retry");
+	check(outcome.permanent.size() == 1 && outcome.permanent.front().second.code == 409, "permanent per-record failures must not retry");
+}
 
-
+void refusesDropWhenQueuedRecordsCannotFreeEnoughMemory()
+{
+	const auto unit = Record { "unit", {}, "application/json", std::string(1024, 'x'), {} }.storageBytes();
+	BoundedQueue queue(10 * unit, OverflowPolicy::DropOldest);
+	for (int index = 0; index < 10; ++index)
+	{
+		check(queue.push(Record { "queued", {}, "application/json", std::string(1024, 'x'), {} }).accepted, "queued fixture records must fit");
+	}
+	for (int index = 0; index < 9; ++index)
+	{
+		check(queue.tryPop().has_value(), "fixture records must become in-flight");
+	}
+	const auto result = queue.push(Record { "large", {}, "application/json", std::string(2048, 'x'), {} });
+	check(!result.accepted, "drop-oldest must reject when in-flight reservations leave insufficient memory");
+	check(result.droppedRecords.empty(), "drop-oldest must not drop queued records when they cannot free enough memory");
+	check(queue.droppedRecords() == 0, "no queued record may be discarded for an impossible drop");
+	check(queue.size() == 1, "the existing queued record must remain intact");
+}
 void releasesPendingRecordsOnShutdown()
 {
 	ClientConfiguration configuration;
@@ -283,13 +317,15 @@ void releasesPendingRecordsOnShutdown()
 	configuration.bucket = "test";
 	UplinkWorker worker(configuration);
 	worker.start();
-	check(worker.enqueue(Record { "entry", TimePoint::clock::now(), "application/json", "1", {} }).accepted, "the record must enter the worker queue");
+	check(worker.enqueue(Record { "entry", TimePoint::clock::now(), "application/json", "1", {}, 42 }).accepted, "the record must enter the worker queue");
 	const auto started = std::chrono::steady_clock::now();
 	worker.stop();
 	check(std::chrono::steady_clock::now() - started < std::chrono::seconds(14),
 		"default shutdown must release queued records before the shutdown deadline");
 	check(worker.status().queuedBytes == 0, "shutdown must release undelivered record reservations");
 	check(worker.status().failedRecords == 1, "shutdown must expose the undelivered record count");
+	check(worker.status().failedRecordsByProducer.at(42) == 1, "shutdown must attribute undelivered records to their writer");
+	check(worker.status().lastErrorCodeByProducer.at(42) == -1, "shutdown must attribute the timeout error code to their writer");
 }
 
 }
@@ -312,8 +348,10 @@ int main()
 		{ "attributes queue rejection", attributesQueueRejectionToProducer },
 		{ "attributes queue drop", attributesQueueDropToProducer },
 		{ "drops oldest queue overflow", dropsOldestRecordWhenConfigured },
+		{ "refuses unsafe drop-oldest", refusesDropWhenQueuedRecordsCannotFreeEnoughMemory },
 		{ "retains transient partial failures", retainsTransientPartialFailuresForRetry },
-		{ "rejects duplicate batch identities", rejectsDuplicateBatchIdentitiesBeforeTransport },
+		{ "partitions partial batch before retry", partitionsPartialBatchBeforeRetry },
+		{ "rejects entire duplicate batch", rejectsEntireBatchWhenDuplicateIdentitiesExist },
 		{ "preserves partial batch identities", preservesPartialBatchRecordIdentity },
 		{ "refuses oversized batch records", refusesRecordThatExceedsBatchLimit },
 		{ "releases pending records on shutdown", releasesPendingRecordsOnShutdown },

@@ -150,6 +150,7 @@ private:
 	std::size_t _observedDelivered { 0 };
 	std::size_t _collectionFailures { 0 };
 	std::size_t _observedCollectionFailures { 0 };
+	std::size_t _observedDeliveryFailures { 0 };
 	std::size_t _duplicateSnapshots { 0 };
 };
 class Skill final : public skill::Skill

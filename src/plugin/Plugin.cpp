@@ -466,10 +466,13 @@ auto ReductWriter::updateState(std::chrono::system_clock::time_point timestamp) 
 	const auto droppedRecords = dropped == status.droppedRecordsByProducer.end() ? 0 : dropped->second;
 	const auto lastError = status.lastErrorCodeByProducer.find(_producerId);
 	const auto lastErrorCode = lastError == status.lastErrorCodeByProducer.end() ? 0 : lastError->second;
+	const auto deliveryFailures = failedRecords + rejectedRecords + droppedRecords;
 	const auto collectionFailed = _collectionFailures != _observedCollectionFailures;
+	const auto deliveryFailed = deliveryFailures != _observedDeliveryFailures;
+	const auto ownFailed = collectionFailed || deliveryFailed;
 	memory::WriteSentinel sentinel { _state };
 	auto& state = *sentinel;
-	state.healthy = status.connected && status.error.empty() && !collectionFailed;
+	state.healthy = status.connected && !ownFailed;
 	state.queuedRecords = status.queuedRecords;
 	state.inFlightRecords = status.inFlightRecords;
 	state.queuedBytes = status.queuedBytes;
@@ -479,21 +482,18 @@ auto ReductWriter::updateState(std::chrono::system_clock::time_point timestamp) 
 	state.collectionFailures = _collectionFailures;
 	state.duplicateSnapshots = _duplicateSnapshots;
 	state.lastErrorCode = lastErrorCode;
-	state.error = status.error.empty() && !collectionFailed ? std::error_code {} : std::make_error_code(std::errc::io_error);
+	state.error = ownFailed ? std::make_error_code(std::errc::io_error) : std::error_code {};
 	state.lastSuccessfulSendTime = status.lastSuccessfulSendTime;
-	if (collectionFailed)
+	if (ownFailed)
 	{
 		_observedCollectionFailures = _collectionFailures;
+		_observedDeliveryFailures = deliveryFailures;
 		sentinel.commit(timestamp, _error);
 	}
 	else if (deliveredRecords > _observedDelivered)
 	{
 		_observedDelivered = deliveredRecords;
 		sentinel.commit(timestamp, _sent);
-	}
-	else if (!status.error.empty())
-	{
-		sentinel.commit(timestamp, _error);
 	}
 	else
 	{

@@ -114,9 +114,17 @@ auto BoundedQueue::push(Record record) -> QueuePushResult
 			++_rejectedRecords;
 			return result;
 		}
+		const auto inFlightBytes = _residentBytes - _queuedBytes;
+		if (inFlightBytes + bytes > _maxPayloadBytes)
+		{
+			++_rejectedRecords;
+			return result;
+		}
 		while (!_records.empty() && _residentBytes + bytes > _maxPayloadBytes)
 		{
-			_residentBytes -= storageBytes(_records.front());
+			const auto droppedBytes = storageBytes(_records.front());
+			_residentBytes -= droppedBytes;
+			_queuedBytes -= droppedBytes;
 			result.droppedRecords.push_back(std::move(_records.front()));
 			_records.pop();
 			++_droppedRecords;
@@ -128,6 +136,7 @@ auto BoundedQueue::push(Record record) -> QueuePushResult
 		}
 	}
 	_residentBytes += bytes;
+	_queuedBytes += bytes;
 	_records.push(std::move(record));
 	result.accepted = true;
 	_changed.notify_one();
@@ -142,6 +151,7 @@ auto BoundedQueue::tryPop() -> std::optional<Record>
 		return std::nullopt;
 	}
 	auto record = std::move(_records.front());
+	_queuedBytes -= storageBytes(record);
 	_records.pop();
 	return record;
 }
@@ -155,6 +165,7 @@ auto BoundedQueue::waitPop(std::chrono::milliseconds timeout) -> std::optional<R
 		return std::nullopt;
 	}
 	auto record = std::move(_records.front());
+	_queuedBytes -= storageBytes(record);
 	_records.pop();
 	return record;
 }
@@ -219,7 +230,7 @@ auto UploadResult::transportFailure(int errorCode, std::string error) -> UploadR
 auto UploadResult::partial(std::vector<RecordFailure> recordFailures) -> UploadResult
 {
 	const auto hasTransientFailure = std::ranges::any_of(recordFailures, [](const RecordFailure& failure) {
-		return failure.code == -1 || failure.code == 408 || failure.code == 429 || failure.code >= 500;
+		return isRetryableError(failure.code);
 	});
 	return { false, hasTransientFailure, 0, "partial batch failure", std::move(recordFailures) };
 }

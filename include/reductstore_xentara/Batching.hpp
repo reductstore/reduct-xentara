@@ -105,10 +105,16 @@ private:
 	std::condition_variable _changed;
 	std::queue<Record> _records;
 	std::size_t _residentBytes { 0 };
+	std::size_t _queuedBytes { 0 };
 	std::size_t _rejectedRecords { 0 };
 	std::size_t _droppedRecords { 0 };
 	bool _closed { false };
 };
+
+[[nodiscard]] inline auto isRetryableError(int code) -> bool
+{
+	return code == -1 || code == 408 || code == 429 || code >= 500;
+}
 
 struct UploadResult
 {

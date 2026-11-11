@@ -21,11 +21,6 @@ public:
 	int code;
 };
 
-auto retryable(int code) -> bool
-{
-	return code == -1 || code == 408 || code == 429 || code >= 500;
-}
-
 auto message(const reduct::Error& error) -> std::string
 {
 	return error.ToString();
@@ -89,18 +84,9 @@ auto ReductTransport::writeBatch(const std::vector<Record>& records) -> UploadRe
 	{
 		++identityCounts[{ record.entry, unixMicroseconds(normalizeTimestamp(record.timestamp)) }];
 	}
-	std::vector<RecordFailure> duplicates;
-	for (const auto& record : records)
+	if (std::ranges::any_of(identityCounts, [](const auto& item) { return item.second > 1; }))
 	{
-		const auto key = std::pair { record.entry, unixMicroseconds(normalizeTimestamp(record.timestamp)) };
-		if (identityCounts.at(key) > 1)
-		{
-			duplicates.push_back({ { record.entry, normalizeTimestamp(record.timestamp) }, 409, "duplicate record identity in batch" });
-		}
-	}
-	if (!duplicates.empty())
-	{
-		return UploadResult::partial(std::move(duplicates));
+		return { false, false, 409, "duplicate record identity in batch", {} };
 	}
 	try
 	{
@@ -112,7 +98,7 @@ auto ReductTransport::writeBatch(const std::vector<Record>& records) -> UploadRe
 		});
 		if (result.error)
 		{
-			return { false, retryable(result.error.code), result.error.code, message(result.error), {} };
+			return { false, isRetryableError(result.error.code), result.error.code, message(result.error), {} };
 		}
 		if (!result.result.empty())
 		{
@@ -130,12 +116,38 @@ auto ReductTransport::writeBatch(const std::vector<Record>& records) -> UploadRe
 	}
 	catch (const TransportException& error)
 	{
-		return { false, retryable(error.code), error.code, error.what(), {} };
+		return { false, isRetryableError(error.code), error.code, error.what(), {} };
 	}
 	catch (const std::exception& error)
 	{
 		return UploadResult::transportFailure(-1, error.what());
 	}
+}
+
+auto partitionPartialBatch(std::vector<Record> records, const UploadResult& result) -> PartialBatchOutcome
+{
+	PartialBatchOutcome outcome;
+	for (auto& record : records)
+	{
+		const RecordIdentity identity { record.entry, normalizeTimestamp(record.timestamp) };
+		const auto failure = std::ranges::find_if(result.recordFailures,
+			[&identity](const RecordFailure& item) {
+				return item.identity.entry == identity.entry && normalizeTimestamp(item.identity.timestamp) == identity.timestamp;
+			});
+		if (failure == result.recordFailures.end())
+		{
+			outcome.succeeded.push_back(std::move(record));
+		}
+		else if (isRetryableError(failure->code))
+		{
+			outcome.retry.push_back(std::move(record));
+		}
+		else
+		{
+			outcome.permanent.emplace_back(std::move(record), *failure);
+		}
+	}
+	return outcome;
 }
 
 
@@ -246,30 +258,43 @@ auto UplinkWorker::run() -> void
 	std::optional<Record> deferred;
 	std::optional<std::chrono::steady_clock::time_point> shutdownDeadline;
 	auto releaseUndelivered = [this, &planner, &pending, &deferred] {
-		auto undelivered = pending.size();
+		std::vector<std::uint64_t> producers;
+		auto collect = [&producers](const Record& record) { producers.push_back(record.producerId); };
 		for (const auto& record : pending)
 		{
 			_queue.release(record);
+			collect(record);
 		}
 		pending.clear();
 		if (deferred)
 		{
 			_queue.release(*deferred);
+			collect(*deferred);
 			deferred.reset();
-			++undelivered;
 		}
 		for (const auto& record : planner.take())
 		{
 			_queue.release(record);
-			++undelivered;
+			collect(record);
 		}
 		while (auto record = _queue.tryPop())
 		{
 			_queue.release(*record);
-			++undelivered;
+			collect(*record);
 		}
 		_inFlightRecords = 0;
-		return undelivered;
+		if (!producers.empty())
+		{
+			std::lock_guard lock(_statusMutex);
+			_status.failedRecords += producers.size();
+			_status.lastErrorCode = -1;
+			for (const auto producer : producers)
+			{
+				++_status.failedRecordsByProducer[producer];
+				_status.lastErrorCodeByProducer[producer] = -1;
+			}
+		}
+		return producers.size();
 	};
 	while (_running || !planner.empty() || _queue.size() != 0 || !pending.empty() || deferred)
 	{
@@ -279,11 +304,7 @@ auto UplinkWorker::run() -> void
 		}
 		if (shutdownDeadline && std::chrono::steady_clock::now() >= *shutdownDeadline)
 		{
-			const auto undelivered = releaseUndelivered();
-			{
-				std::lock_guard lock(_statusMutex);
-				_status.failedRecords += undelivered;
-			}
+			releaseUndelivered();
 			setFailure(-1, "shutdown final flush timed out with undelivered records");
 			return;
 		}
@@ -339,19 +360,57 @@ auto UplinkWorker::run() -> void
 			_inFlightRecords = pending.size() + (deferred ? 1 : 0);
 		}
 		UploadResult result;
+		bool partialResolved = false;
 		for (std::size_t attempt = 0; attempt < _configuration.retry.maxAttempts; ++attempt)
 		{
 			if (shutdownDeadline && std::chrono::steady_clock::now() + _configuration.requestTimeout > *shutdownDeadline)
 			{
-				const auto undelivered = releaseUndelivered();
-				{
-					std::lock_guard lock(_statusMutex);
-					_status.failedRecords += undelivered;
-				}
+				releaseUndelivered();
 				setFailure(-1, "shutdown final flush timed out before another HTTP request");
 				return;
 			}
 			result = transport.writeBatch(pending);
+			if (!result.delivered && !result.recordFailures.empty())
+			{
+				int transientCode = 0;
+				for (const auto& failure : result.recordFailures)
+				{
+					if (isRetryableError(failure.code))
+					{
+						transientCode = failure.code;
+					}
+				}
+				auto outcome = partitionPartialBatch(std::move(pending), result);
+				std::lock_guard lock(_statusMutex);
+				_status.connected = true;
+				for (auto& record : outcome.succeeded)
+				{
+					_queue.release(record);
+					++_status.deliveredRecords;
+					++_status.deliveredRecordsByProducer[record.producerId];
+					_status.lastSuccessfulSendTime = TimePoint::clock::now();
+				}
+				for (auto& [record, failure] : outcome.permanent)
+				{
+					_queue.release(record);
+					++_status.failedRecords;
+					++_status.failedRecordsByProducer[record.producerId];
+					_status.lastErrorCode = failure.code;
+					_status.lastErrorCodeByProducer[record.producerId] = failure.code;
+					_status.error = failure.message;
+				}
+				pending = std::move(outcome.retry);
+				for (const auto& record : pending)
+				{
+					_status.lastErrorCodeByProducer[record.producerId] = transientCode;
+				}
+				_inFlightRecords = pending.size() + (deferred ? 1 : 0);
+				if (pending.empty())
+				{
+					partialResolved = true;
+					break;
+				}
+			}
 			if (result.delivered || !result.retryable || attempt + 1 == _configuration.retry.maxAttempts || !_running)
 			{
 				break;
@@ -384,64 +443,8 @@ auto UplinkWorker::run() -> void
 			_inFlightRecords = deferred ? 1 : 0;
 			continue;
 		}
-		if (!result.recordFailures.empty())
+		if (partialResolved)
 		{
-			int transientCode = 0;
-			std::string transientError;
-			{
-				std::lock_guard lock(_statusMutex);
-				_status.connected = true;
-			}
-			std::vector<Record> retry;
-			for (auto& record : pending)
-			{
-				const RecordIdentity identity { record.entry, normalizeTimestamp(record.timestamp) };
-				const auto failure = std::ranges::find_if(result.recordFailures,
-					[&identity](const RecordFailure& item) { return item.identity == identity; });
-				if (failure == result.recordFailures.end())
-				{
-					_queue.release(record);
-					std::lock_guard lock(_statusMutex);
-					++_status.deliveredRecords;
-					++_status.deliveredRecordsByProducer[record.producerId];
-					_status.lastSuccessfulSendTime = TimePoint::clock::now();
-					continue;
-				}
-				if (retryable(failure->code))
-				{
-					transientCode = failure->code;
-					transientError = failure->message;
-					retry.push_back(std::move(record));
-					continue;
-				}
-				_queue.release(record);
-				std::lock_guard lock(_statusMutex);
-				++_status.failedRecords;
-				++_status.failedRecordsByProducer[record.producerId];
-				_status.lastErrorCode = failure->code;
-				_status.lastErrorCodeByProducer[record.producerId] = failure->code;
-				_status.error = failure->message;
-			}
-			pending = std::move(retry);
-			_inFlightRecords = pending.size() + (deferred ? 1 : 0);
-			if (pending.empty())
-			{
-				continue;
-			}
-			{
-				std::lock_guard lock(_statusMutex);
-				_status.lastErrorCode = transientCode;
-				_status.error = std::move(transientError);
-				for (const auto& record : pending)
-				{
-					_status.lastErrorCodeByProducer[record.producerId] = transientCode;
-				}
-			}
-			const auto retryAt = std::chrono::steady_clock::now() + _configuration.retry.maximumBackoff;
-			while (_running && std::chrono::steady_clock::now() < retryAt)
-			{
-				std::this_thread::sleep_for(std::chrono::milliseconds(10));
-			}
 			continue;
 		}
 		if (!result.retryable)
