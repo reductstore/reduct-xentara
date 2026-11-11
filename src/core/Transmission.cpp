@@ -244,10 +244,15 @@ auto UplinkWorker::setFailure(int code, std::string error) -> void
 
 auto UplinkWorker::waitWhileRunning(std::chrono::milliseconds delay) -> void
 {
-	const auto until = std::chrono::steady_clock::now() + delay;
-	while (_running && std::chrono::steady_clock::now() < until)
+	const auto slice = std::chrono::milliseconds(10);
+	while (_running && delay >= slice)
 	{
-		std::this_thread::sleep_for(std::chrono::milliseconds(10));
+		std::this_thread::sleep_for(slice);
+		delay -= slice;
+	}
+	if (_running && delay > std::chrono::milliseconds::zero())
+	{
+		std::this_thread::sleep_for(delay);
 	}
 }
 

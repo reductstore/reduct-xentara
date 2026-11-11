@@ -219,13 +219,14 @@ void workerStopsWithinShutdownTimeout()
 	config.shutdownTimeout = std::chrono::milliseconds(100);
 	config.maxBatchRecords = 1;
 	config.maxBatchAge = std::chrono::milliseconds(1);
-	config.retry.maximumBackoff = std::chrono::seconds(1);
+	config.retry.initialBackoff = std::chrono::milliseconds::max();
+	config.retry.maximumBackoff = std::chrono::milliseconds::max();
 	UplinkWorker worker(config);
 	worker.start();
 	check(worker.enqueue(Record { "shutdown/value", TimePoint::clock::now(), "application/json", "1", {} }),
 		"shutdown record must enter the queue");
-	check(waitFor([&worker] { return !worker.status().error.empty(); }, std::chrono::seconds(2)),
-		"worker must attempt the unavailable server");
+	check(waitFor([&worker] { return worker.status().inFlightRecords == 1; }, std::chrono::seconds(2)),
+		"worker must begin processing the unavailable record");
 	const auto started = std::chrono::steady_clock::now();
 	worker.stop();
 	check(std::chrono::steady_clock::now() - started < std::chrono::milliseconds(250),
@@ -265,6 +266,7 @@ int main()
 		writesAndReadsProductionSnapshot();
 		detectsDuplicateTimestamp();
 		reportsUnavailableServer();
+		workerStopsWithinShutdownTimeout();
 		preservesConnectivityAfterDuplicateRecordFailure();
 		workerCompletesSuccessfulRecordsFromPartialBatch();
 	}
