@@ -72,7 +72,7 @@ docker compose -f examples/compose.yaml down -v
 
 Enable integration tests with `-DREDUCTSTORE_XENTARA_ENABLE_INTEGRATION_TESTS=ON`, then run `ctest --test-dir build --output-on-failure` and `tests/integration-recovery.sh`. They cover batch admission limits, queue rejection and drop attribution, snapshot metadata, immutable timestamp conflicts, duplicate batch identities, per-record partial failures, unavailable-server retry, recovery of a queued record across a real server restart, and bounded shutdown.
 
-With a signed `ReductStore` entitlement installed, run `tests/e2e-demo.sh` to validate model loading and a stored six-signal snapshot.
+With a signed `ReductStore` entitlement installed, run `tests/e2e-demo.sh` to validate model loading and a stored six-signal snapshot. It starts an isolated temporary ReductStore container on a dynamically allocated loopback port and never accesses the Compose demo volume.
 
 A signed Xentara entitlement for the `ReductStore` skill is required to execute the demo model. Use the `latest_record` timestamp returned by the bucket request to read a snapshot.
 
