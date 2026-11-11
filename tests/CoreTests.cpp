@@ -88,13 +88,18 @@ void serializesNumericMeasurements()
 	check(serializeScalar(std::intmax_t(-17)) == "-17", "signed integers must retain their value");
 	check(serializeScalar(std::uintmax_t(42)) == "42", "unsigned integers must retain their value");
 	check(serializeScalar(3.25) == "3.25", "floating point values must be JSON numbers");
+	check(serializeScalar(75.0) == "75.0", "whole-number doubles must retain their floating-point representation");
+	check(serializeScalar(-0.0) == "-0.0", "negative zero must retain its floating-point representation");
+	check(serializeScalar(1e100) == "1e+100", "scientific notation must remain a floating-point representation");
+	check(trySerializeScalar(75.0) == "75.0", "optional floating-point serialization must retain whole-number doubles");
 	check(serializeScalar(true) == "true", "booleans must be JSON booleans");
 }
 
 void rejectsNonFiniteMeasurementsWithoutSerialization()
 {
 	check(!trySerializeScalar(std::numeric_limits<double>::quiet_NaN()), "NaN must be rejected before JSON serialization");
-	check(!trySerializeScalar(std::numeric_limits<double>::infinity()), "infinity must be rejected before JSON serialization");
+	check(!trySerializeScalar(std::numeric_limits<double>::infinity()), "positive infinity must be rejected before JSON serialization");
+	check(!trySerializeScalar(-std::numeric_limits<double>::infinity()), "negative infinity must be rejected before JSON serialization");
 	check(trySerializeScalar(3.25) == "3.25", "finite floating-point values must remain JSON numbers");
 }
 

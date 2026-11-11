@@ -13,7 +13,7 @@ namespace
 {
 
 template <typename Value>
-auto asJsonNumber(Value value) -> std::string
+auto asJsonNumber(Value value, bool preserveFloatingPoint = false) -> std::string
 {
 	std::array<char, 128> buffer {};
 	const auto [end, error] = std::to_chars(buffer.data(), buffer.data() + buffer.size(), value);
@@ -21,7 +21,16 @@ auto asJsonNumber(Value value) -> std::string
 	{
 		throw std::runtime_error("failed to serialize numeric measurement");
 	}
-	return { buffer.data(), end };
+	const auto number = std::string_view(buffer.data(), static_cast<std::size_t>(end - buffer.data()));
+	if (!preserveFloatingPoint || number.find_first_of(".eE") != std::string_view::npos)
+	{
+		return std::string(number);
+	}
+	std::string result;
+	result.reserve(number.size() + 2);
+	result.append(number);
+	result.append(".0");
+	return result;
 }
 
 
@@ -84,7 +93,7 @@ auto serializeScalar(double value) -> std::string
 	{
 		throw std::invalid_argument("JSON does not support non-finite floating-point values");
 	}
-	return asJsonNumber(value);
+	return asJsonNumber(value, true);
 }
 
 auto trySerializeScalar(double value) -> std::optional<std::string>
@@ -93,7 +102,7 @@ auto trySerializeScalar(double value) -> std::optional<std::string>
 	{
 		return std::nullopt;
 	}
-	return asJsonNumber(value);
+	return asJsonNumber(value, true);
 }
 
 auto serializeString(std::string_view value) -> std::string
