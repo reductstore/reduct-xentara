@@ -43,8 +43,19 @@ BatchPlanner::BatchPlanner(BatchLimits limits) :
 {
 }
 
-auto BatchPlanner::push(Record record, std::chrono::steady_clock::time_point collectedAt) -> void
+auto BatchPlanner::accepts(const Record& record) const noexcept -> bool
 {
+	return _records.size() < _limits.maxRecords &&
+		record.payload.size() <= _limits.maxPayloadBytes - std::min(_payloadBytes, _limits.maxPayloadBytes) &&
+		record.metadataBytes() <= _limits.maxMetadataBytes - std::min(_metadataBytes, _limits.maxMetadataBytes);
+}
+
+auto BatchPlanner::push(Record record, std::chrono::steady_clock::time_point collectedAt) -> bool
+{
+	if (!accepts(record))
+	{
+		return false;
+	}
 	if (_records.empty())
 	{
 		_firstCollectedAt = collectedAt;
@@ -52,6 +63,7 @@ auto BatchPlanner::push(Record record, std::chrono::steady_clock::time_point col
 	_payloadBytes += record.payload.size();
 	_metadataBytes += record.metadataBytes();
 	_records.push_back(std::move(record));
+	return true;
 }
 
 auto BatchPlanner::shouldFlush(std::chrono::steady_clock::time_point now) const -> bool
@@ -85,38 +97,41 @@ BoundedQueue::BoundedQueue(std::size_t maxPayloadBytes, OverflowPolicy policy) :
 {
 }
 
-auto BoundedQueue::push(Record record) -> bool
+auto BoundedQueue::push(Record record) -> QueuePushResult
 {
 	const auto bytes = storageBytes(record);
 	std::lock_guard lock(_mutex);
 	if (_closed || bytes > _maxPayloadBytes)
 	{
 		++_rejectedRecords;
-		return false;
+		return {};
 	}
+	QueuePushResult result;
 	if (_residentBytes + bytes > _maxPayloadBytes)
 	{
 		if (_policy == OverflowPolicy::RejectNewest)
 		{
 			++_rejectedRecords;
-			return false;
+			return result;
 		}
 		while (!_records.empty() && _residentBytes + bytes > _maxPayloadBytes)
 		{
 			_residentBytes -= storageBytes(_records.front());
+			result.droppedRecords.push_back(std::move(_records.front()));
 			_records.pop();
 			++_droppedRecords;
 		}
 		if (_residentBytes + bytes > _maxPayloadBytes)
 		{
 			++_rejectedRecords;
-			return false;
+			return result;
 		}
 	}
 	_residentBytes += bytes;
 	_records.push(std::move(record));
+	result.accepted = true;
 	_changed.notify_one();
-	return true;
+	return result;
 }
 
 auto BoundedQueue::tryPop() -> std::optional<Record>
@@ -203,7 +218,10 @@ auto UploadResult::transportFailure(int errorCode, std::string error) -> UploadR
 
 auto UploadResult::partial(std::vector<RecordFailure> recordFailures) -> UploadResult
 {
-	return { false, false, 0, "partial batch failure", std::move(recordFailures) };
+	const auto hasTransientFailure = std::ranges::any_of(recordFailures, [](const RecordFailure& failure) {
+		return failure.code == -1 || failure.code == 408 || failure.code == 429 || failure.code >= 500;
+	});
+	return { false, hasTransientFailure, 0, "partial batch failure", std::move(recordFailures) };
 }
 
 

@@ -15,12 +15,22 @@
 namespace reductstore_xentara
 {
 
+struct EnqueueResult
+{
+	bool accepted { false };
+	std::optional<std::uint64_t> droppedProducerId;
+};
+
 struct DeliveryStatus
 {
 	bool connected { false };
 	std::size_t deliveredRecords { 0 };
 	std::map<std::uint64_t, std::size_t> deliveredRecordsByProducer;
 	std::size_t failedRecords { 0 };
+	std::map<std::uint64_t, std::size_t> failedRecordsByProducer;
+	std::map<std::uint64_t, std::size_t> rejectedRecordsByProducer;
+	std::map<std::uint64_t, std::size_t> droppedRecordsByProducer;
+	std::map<std::uint64_t, int> lastErrorCodeByProducer;
 	std::size_t queuedRecords { 0 };
 	std::size_t inFlightRecords { 0 };
 	std::size_t queuedBytes { 0 };
@@ -56,7 +66,7 @@ public:
 
 	auto start() -> void;
 	auto stop() -> void;
-	[[nodiscard]] auto enqueue(Record record) -> bool;
+	[[nodiscard]] auto enqueue(Record record) -> EnqueueResult;
 	[[nodiscard]] auto status() const -> DeliveryStatus;
 	[[nodiscard]] auto rejectedRecords() const -> std::size_t;
 	[[nodiscard]] auto droppedRecords() const -> std::size_t;

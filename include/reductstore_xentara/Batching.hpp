@@ -7,13 +7,11 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
-#include <functional>
 #include <map>
 #include <mutex>
 #include <optional>
 #include <queue>
 #include <string>
-#include <thread>
 #include <vector>
 
 namespace reductstore_xentara
@@ -64,7 +62,8 @@ class BatchPlanner final
 {
 public:
 	explicit BatchPlanner(BatchLimits limits);
-	auto push(Record record, std::chrono::steady_clock::time_point collectedAt) -> void;
+	[[nodiscard]] auto accepts(const Record& record) const noexcept -> bool;
+	[[nodiscard]] auto push(Record record, std::chrono::steady_clock::time_point collectedAt) -> bool;
 	[[nodiscard]] auto shouldFlush(std::chrono::steady_clock::time_point now) const -> bool;
 	[[nodiscard]] auto take() -> std::vector<Record>;
 	[[nodiscard]] auto empty() const noexcept -> bool;
@@ -77,11 +76,17 @@ private:
 	std::optional<std::chrono::steady_clock::time_point> _firstCollectedAt;
 };
 
+struct QueuePushResult
+{
+	bool accepted { false };
+	std::vector<Record> droppedRecords;
+};
+
 class BoundedQueue final
 {
 public:
 	explicit BoundedQueue(std::size_t maxPayloadBytes, OverflowPolicy policy);
-	auto push(Record record) -> bool;
+	[[nodiscard]] auto push(Record record) -> QueuePushResult;
 	[[nodiscard]] auto tryPop() -> std::optional<Record>;
 	[[nodiscard]] auto waitPop(std::chrono::milliseconds timeout) -> std::optional<Record>;
 	auto release(const Record& record) -> void;
@@ -118,26 +123,6 @@ struct UploadResult
 	[[nodiscard]] static auto partial(std::vector<RecordFailure> recordFailures) -> UploadResult;
 };
 
-template <typename Upload>
-auto retryTransient(const RetryPolicy& policy, Upload&& upload) -> UploadResult
-{
-	UploadResult result;
-	for (std::size_t attempt = 0; attempt < policy.maxAttempts; ++attempt)
-	{
-		result = std::invoke(upload);
-		if (result.delivered || !result.retryable || attempt + 1 == policy.maxAttempts)
-		{
-			return result;
-		}
-		const auto multiplier = std::int64_t { 1 } << attempt;
-		const auto delay = std::min(policy.maximumBackoff, policy.initialBackoff * multiplier);
-		if (delay.count() > 0)
-		{
-			std::this_thread::sleep_for(delay);
-		}
-	}
-	return result;
-}
 
 
 }

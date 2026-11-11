@@ -20,6 +20,7 @@
 #include <xentara/utils/json/decoder/Errors.hpp>
 #include <xentara/utils/json/decoder/Object.hpp>
 
+#include <algorithm>
 #include <stdexcept>
 #include <string_view>
 
@@ -45,6 +46,7 @@ const model::Attribute kDroppedRecords { "a55ee685-69e2-4e9d-b889-64c64eeb6024"_
 const model::Attribute kFailedRecords { "55c99df4-78e5-4c6a-9d93-870d71a67b5a"_uuid, "failedRecords"sv, model::Attribute::Access::ReadOnly, data::DataType::kInteger };
 const model::Attribute kCollectionFailures { "461a7d30-ec81-41d9-b630-6187eeef6d3d"_uuid, "collectionFailures"sv, model::Attribute::Access::ReadOnly, data::DataType::kInteger };
 const model::Attribute kDuplicateSnapshots { "bbdb44e0-f343-4fd1-b1f9-9e5ab4c62209"_uuid, "duplicateSnapshots"sv, model::Attribute::Access::ReadOnly, data::DataType::kInteger };
+const model::Attribute kLastErrorCode { "3471b8be-11a7-4c0a-9e7e-cbbde003ab19"_uuid, "lastErrorCode"sv, model::Attribute::Access::ReadOnly, data::DataType::kInteger };
 const model::Attribute kLastSuccessfulSendTime { "b33cac6d-19b0-4fc5-b8b9-1c8abcf57cf0"_uuid, "lastSuccessfulSendTime"sv, model::Attribute::Access::ReadOnly, data::DataType::kTimeStamp };
 const model::Attribute kError { model::Attribute::kError, model::Attribute::Access::ReadOnly, data::DataType::kErrorCode };
 const process::Event::Role kSent { "c0d111f6-2f1b-497a-bcaf-837c6f56add6"_uuid, "sent"sv };
@@ -194,7 +196,7 @@ auto ReductWriter::forEachAttribute(const model::ForEachAttributeFunction& funct
 {
 	return function(kHealthy) || function(kQueuedRecords) || function(kInFlightRecords) || function(kQueuedBytes) || function(kRejectedRecords) ||
 		function(kDroppedRecords) || function(kFailedRecords) || function(kCollectionFailures) ||
-		function(kDuplicateSnapshots) || function(kLastSuccessfulSendTime) || function(kError);
+		function(kDuplicateSnapshots) || function(kLastErrorCode) || function(kLastSuccessfulSendTime) || function(kError);
 }
 
 auto ReductWriter::forEachEvent(const model::ForEachEventFunction& function) -> bool
@@ -218,6 +220,7 @@ auto ReductWriter::makeReadHandle(const model::Attribute& attribute) const noexc
 	if (attribute == kFailedRecords) return _state.member(&State::failedRecords);
 	if (attribute == kCollectionFailures) return _state.member(&State::collectionFailures);
 	if (attribute == kDuplicateSnapshots) return _state.member(&State::duplicateSnapshots);
+	if (attribute == kLastErrorCode) return _state.member(&State::lastErrorCode);
 	if (attribute == kLastSuccessfulSendTime) return _state.member(&State::lastSuccessfulSendTime);
 	if (attribute == kError) return _state.member(&State::error);
 	return std::nullopt;
@@ -317,7 +320,6 @@ auto ReductWriter::Snapshot::collect(std::chrono::system_clock::time_point sched
 	auto recordLabels = labels;
 	recordLabels["host"] = host;
 	recordLabels["quality"] = data::toString(*aggregateQuality);
-	lastTimestamp = recordTimestamp;
 	return {
 		CollectionStatus::Collected,
 		reductstore_xentara::Record {
@@ -386,6 +388,10 @@ auto ReductWriter::load(utils::json::decoder::Object& object, config::Context& c
 				{
 					throw std::runtime_error("each snapshot record group requires mode, relative entry, scheduled timestampSource, and measurements");
 				}
+				if (std::ranges::any_of(_snapshots, [&snapshot](const Snapshot& item) { return item.entry == snapshot.entry; }))
+				{
+					throw std::runtime_error("snapshot record groups in one writer must use distinct entries");
+				}
 				_snapshots.push_back(std::move(snapshot));
 			}
 		}
@@ -427,7 +433,14 @@ auto ReductWriter::collect(const process::ExecutionContext& context) -> void
 					continue;
 				}
 				result.record->producerId = _producerId;
-				(void)_client.get().worker().enqueue(std::move(*result.record));
+				const auto recordTimestamp = result.record->timestamp;
+				const auto enqueue = _client.get().worker().enqueue(std::move(*result.record));
+				if (!enqueue.accepted)
+				{
+					++_collectionFailures;
+					continue;
+				}
+				snapshot.lastTimestamp = recordTimestamp;
 			}
 			catch (const std::exception&)
 			{
@@ -445,6 +458,14 @@ auto ReductWriter::updateState(std::chrono::system_clock::time_point timestamp) 
 	const auto status = _client.get().worker().status();
 	const auto delivered = status.deliveredRecordsByProducer.find(_producerId);
 	const auto deliveredRecords = delivered == status.deliveredRecordsByProducer.end() ? 0 : delivered->second;
+	const auto failed = status.failedRecordsByProducer.find(_producerId);
+	const auto failedRecords = failed == status.failedRecordsByProducer.end() ? 0 : failed->second;
+	const auto rejected = status.rejectedRecordsByProducer.find(_producerId);
+	const auto rejectedRecords = rejected == status.rejectedRecordsByProducer.end() ? 0 : rejected->second;
+	const auto dropped = status.droppedRecordsByProducer.find(_producerId);
+	const auto droppedRecords = dropped == status.droppedRecordsByProducer.end() ? 0 : dropped->second;
+	const auto lastError = status.lastErrorCodeByProducer.find(_producerId);
+	const auto lastErrorCode = lastError == status.lastErrorCodeByProducer.end() ? 0 : lastError->second;
 	const auto collectionFailed = _collectionFailures != _observedCollectionFailures;
 	memory::WriteSentinel sentinel { _state };
 	auto& state = *sentinel;
@@ -452,11 +473,12 @@ auto ReductWriter::updateState(std::chrono::system_clock::time_point timestamp) 
 	state.queuedRecords = status.queuedRecords;
 	state.inFlightRecords = status.inFlightRecords;
 	state.queuedBytes = status.queuedBytes;
-	state.rejectedRecords = _client.get().worker().rejectedRecords();
-	state.droppedRecords = _client.get().worker().droppedRecords();
-	state.failedRecords = status.failedRecords;
+	state.rejectedRecords = rejectedRecords;
+	state.droppedRecords = droppedRecords;
+	state.failedRecords = failedRecords;
 	state.collectionFailures = _collectionFailures;
 	state.duplicateSnapshots = _duplicateSnapshots;
+	state.lastErrorCode = lastErrorCode;
 	state.error = status.error.empty() && !collectionFailed ? std::error_code {} : std::make_error_code(std::errc::io_error);
 	state.lastSuccessfulSendTime = status.lastSuccessfulSendTime;
 	if (collectionFailed)

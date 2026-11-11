@@ -77,6 +77,7 @@ private:
 		std::uint64_t failedRecords { 0 };
 		std::uint64_t collectionFailures { 0 };
 		std::uint64_t duplicateSnapshots { 0 };
+		std::int64_t lastErrorCode { 0 };
 		std::error_code error;
 		std::chrono::system_clock::time_point lastSuccessfulSendTime { std::chrono::system_clock::time_point::min() };
 	};

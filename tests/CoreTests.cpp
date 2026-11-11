@@ -48,6 +48,10 @@ void rejectsInvalidConfiguration()
 	config.shutdownTimeout = std::chrono::milliseconds(1);
 	config.requestTimeout = std::chrono::milliseconds(2);
 	check(!validate(config).empty(), "a shutdown timeout shorter than a request must be rejected");
+
+	ClientConfiguration shutdownConfiguration;
+	check(shutdownConfiguration.shutdownTimeout > shutdownConfiguration.requestTimeout,
+		"default shutdown time must allow at least one final HTTP request");
 }
 
 void namespacesEntriesWithoutMandatoryPrefix()
@@ -131,11 +135,27 @@ void selectsBatchBoundaries()
 	limits.maxAge = std::chrono::seconds(2);
 	BatchPlanner planner(limits);
 	const auto now = std::chrono::steady_clock::now();
-	planner.push(Record { "a", {}, "application/json", "12", {} }, now);
+	check(planner.push(Record { "a", {}, "application/json", "12", {} }, now), "the first record must enter the planner");
 	check(!planner.shouldFlush(now), "a non-full batch must remain queued");
-	planner.push(Record { "b", {}, "application/json", "345", {} }, now);
+	check(planner.push(Record { "b", {}, "application/json", "345", {} }, now), "the second record must enter the planner");
 	check(planner.shouldFlush(now), "the payload threshold must flush a batch");
 	check(planner.take().size() == 2, "the planner must keep multiple entries together");
+}
+
+void refusesRecordThatExceedsBatchLimit()
+{
+	BatchLimits limits;
+	limits.maxRecords = 2;
+	limits.maxPayloadBytes = 5;
+	limits.maxMetadataBytes = 100;
+	BatchPlanner planner(limits);
+	const auto now = std::chrono::steady_clock::now();
+	const Record first { "a", {}, "application/json", "123", {} };
+	const Record second { "b", {}, "application/json", "456", {} };
+	check(planner.accepts(first), "the first record must fit");
+	check(planner.push(first, now), "the first record must enter the planner");
+	check(!planner.accepts(second), "a record that exceeds a batch payload limit must not fit");
+	check(!planner.push(second, now), "the planner must refuse a record that exceeds a batch limit");
 }
 
 void flushesAtMetadataBoundary()
@@ -147,9 +167,9 @@ void flushesAtMetadataBoundary()
 	limits.maxAge = std::chrono::seconds(2);
 	BatchPlanner planner(limits);
 	const auto now = std::chrono::steady_clock::now();
-	planner.push(Record { "a", {}, "", "", {} }, now);
+	check(planner.push(Record { "a", {}, "", "", {} }, now), "the first metadata record must enter the planner");
 	check(!planner.shouldFlush(now), "one metadata record must remain queued");
-	planner.push(Record { "b", {}, "", "", {} }, now);
+	check(planner.push(Record { "b", {}, "", "", {} }, now), "the second metadata record must enter the planner");
 	check(planner.shouldFlush(now), "the metadata threshold must flush a batch");
 }
 
@@ -157,14 +177,14 @@ void accountsForMetadataAndInflightRecords()
 {
 	const Record record { "edge-01/telemetry/temperature", {}, "application/json", "1234", { { "host", "edge-01" }, { "source", "Sensors.Temperature" } } };
 	BoundedQueue queue(record.storageBytes(), OverflowPolicy::RejectNewest);
-	check(queue.push(record), "a record must fit within its exact queue budget");
+	check(queue.push(record).accepted, "a record must fit within its exact queue budget");
 	auto inflight = queue.tryPop();
 	check(inflight.has_value(), "the queued record must become in-flight");
 	check(queue.residentBytes() == record.storageBytes(), "in-flight records must remain in the memory budget");
-	check(!queue.push(record), "a second record must be rejected while the first is in-flight");
+	check(!queue.push(record).accepted, "a second record must be rejected while the first is in-flight");
 	queue.release(*inflight);
 	check(queue.residentBytes() == 0, "delivered records must release the complete memory reservation");
-	check(queue.push(record), "released memory must accept a new record");
+	check(queue.push(record).accepted, "released memory must accept a new record");
 }
 
 void preservesPartialBatchRecordIdentity()
@@ -178,56 +198,82 @@ void preservesPartialBatchRecordIdentity()
 	check(partial.recordFailures.front().code == 409, "partial failures must retain the ReductStore error code");
 }
 
-void retriesTransientFailures()
+void retainsTransientPartialFailuresForRetry()
 {
-	RetryPolicy retry { 3, std::chrono::milliseconds(0), std::chrono::milliseconds(0) };
-	std::size_t attempts = 0;
-	const auto result = retryTransient(retry, [&attempts] {
-		++attempts;
-		return attempts == 3 ? UploadResult::success() : UploadResult::transportFailure(-1, "unavailable");
-	});
-	check(result.delivered, "a retry succeeding within the bound must be delivered");
-	check(attempts == 3, "transient failures must use the configured retry bound");
+	const auto partial = UploadResult::partial({ { { "entry-a", {}, }, 503, "unavailable" } });
+	check(partial.retryable, "a transient per-record batch error must keep the failed record retryable");
 }
 
-void doesNotRetryPermanentFailures()
-{
-	RetryPolicy retry { 3, std::chrono::milliseconds(0), std::chrono::milliseconds(0) };
-	std::size_t attempts = 0;
-	const auto result = retryTransient(retry, [&attempts] {
-		++attempts;
-		return UploadResult { false, false, 403, "forbidden", {} };
-	});
-	check(!result.delivered, "a permanent failure must remain undelivered");
-	check(attempts == 1, "a permanent failure must not be retried");
-}
 
 void rejectsOverflowWithoutDiscardingQueuedRecords()
 {
 	const Record first { "a", {}, "application/json", "1234", {} };
 	BoundedQueue queue(first.storageBytes(), OverflowPolicy::RejectNewest);
-	check(queue.push(first), "the first record must fit");
-	check(!queue.push(Record { "b", {}, "application/json", "1", {} }), "a full queue must reject the new record");
+	check(queue.push(first).accepted, "the first record must fit");
+	check(!queue.push(Record { "b", {}, "application/json", "1", {} }).accepted, "a full queue must reject the new record");
 	check(queue.size() == 1, "overflow must preserve queued records");
 	check(queue.rejectedRecords() == 1, "queue loss must be observable");
+}
+
+void attributesQueueRejectionToProducer()
+{
+	const Record record { "a", {}, "application/json", "1234", {}, 7 };
+	ClientConfiguration configuration;
+	configuration.maxQueueBytes = record.storageBytes();
+	UplinkWorker worker(configuration);
+	check(worker.enqueue(record).accepted, "the first producer record must fit");
+	check(!worker.enqueue(Record { "b", {}, "application/json", "1", {}, 9 }).accepted,
+		"a full queue must reject the next producer record");
+	const auto status = worker.status();
+	check(status.rejectedRecordsByProducer.at(9) == 1, "queue rejection must be attributed to its producer");
+	check(status.failedRecordsByProducer.at(9) == 1, "queue rejection must be counted as a producer delivery failure");
 }
 
 void dropsOldestRecordWhenConfigured()
 {
 	const Record first { "a", {}, "application/json", "1234", {} };
 	BoundedQueue queue(first.storageBytes(), OverflowPolicy::DropOldest);
-	check(queue.push(first), "the first record must fit");
-	check(queue.push(Record { "b", {}, "application/json", "1234", {} }), "drop-oldest overflow must accept the replacement record");
+	check(queue.push(first).accepted, "the first record must fit");
+	const auto result = queue.push(Record { "b", {}, "application/json", "1234", {} });
+	check(result.accepted, "drop-oldest overflow must accept the replacement record");
+	check(result.droppedRecords.size() == 1 && result.droppedRecords.front().entry == "a",
+		"drop-oldest overflow must identify the discarded record");
 	const auto record = queue.tryPop();
 	check(record && record->entry == "b", "drop-oldest overflow must retain the newest record");
 	check(queue.droppedRecords() == 1, "dropped records must be observable");
 }
 
-void retriesTransientFailuresAndPreservesPartialFailures()
+void attributesQueueDropToProducer()
 {
-	retriesTransientFailures();
-	preservesPartialBatchRecordIdentity();
+	const Record first { "a", {}, "application/json", "1234", {}, 7 };
+	ClientConfiguration configuration;
+	configuration.maxQueueBytes = first.storageBytes();
+	configuration.overflowPolicy = OverflowPolicy::DropOldest;
+	UplinkWorker worker(configuration);
+	check(worker.enqueue(first).accepted, "the first producer record must fit");
+	check(worker.enqueue(Record { "b", {}, "application/json", "1234", {}, 9 }).accepted,
+		"drop-oldest policy must accept the replacement record");
+	const auto status = worker.status();
+	check(status.droppedRecordsByProducer.at(7) == 1, "queue drop must be attributed to the discarded producer");
+	check(status.failedRecordsByProducer.at(7) == 1, "queue drop must count as a producer delivery failure");
 }
+
+void rejectsDuplicateBatchIdentitiesBeforeTransport()
+{
+	ClientConfiguration configuration;
+	configuration.serverUrl = "http://127.0.0.1:1";
+	configuration.bucket = "test";
+	ReductTransport transport(configuration);
+	const auto timestamp = TimePoint::clock::now();
+	const auto result = transport.writeBatch({
+		{ "duplicate", timestamp, "application/json", "1", {} },
+		{ "duplicate", timestamp, "application/json", "2", {} },
+	});
+	check(!result.delivered, "duplicate batch identities must not be delivered");
+	check(result.recordFailures.size() == 2, "every duplicate batch record must be reported");
+	check(result.recordFailures.front().code == 409, "duplicate batch records must use the conflict status");
+}
+
 
 
 void releasesPendingRecordsOnShutdown()
@@ -235,14 +281,13 @@ void releasesPendingRecordsOnShutdown()
 	ClientConfiguration configuration;
 	configuration.serverUrl = "http://127.0.0.1:1";
 	configuration.bucket = "test";
-	configuration.connectionTimeout = std::chrono::milliseconds(10);
-	configuration.requestTimeout = std::chrono::milliseconds(10);
-	configuration.retry.maxAttempts = 1;
-	configuration.maxBatchAge = std::chrono::milliseconds(0);
 	UplinkWorker worker(configuration);
 	worker.start();
-	check(worker.enqueue(Record { "entry", TimePoint::clock::now(), "application/json", "1", {} }), "the record must enter the worker queue");
+	check(worker.enqueue(Record { "entry", TimePoint::clock::now(), "application/json", "1", {} }).accepted, "the record must enter the worker queue");
+	const auto started = std::chrono::steady_clock::now();
 	worker.stop();
+	check(std::chrono::steady_clock::now() - started < std::chrono::seconds(14),
+		"default shutdown must release queued records before the shutdown deadline");
 	check(worker.status().queuedBytes == 0, "shutdown must release undelivered record reservations");
 	check(worker.status().failedRecords == 1, "shutdown must expose the undelivered record count");
 }
@@ -264,9 +309,13 @@ int main()
 		{ "flushes at metadata boundary", flushesAtMetadataBoundary },
 		{ "accounts for metadata and in-flight records", accountsForMetadataAndInflightRecords },
 		{ "rejects queue overflow", rejectsOverflowWithoutDiscardingQueuedRecords },
+		{ "attributes queue rejection", attributesQueueRejectionToProducer },
+		{ "attributes queue drop", attributesQueueDropToProducer },
 		{ "drops oldest queue overflow", dropsOldestRecordWhenConfigured },
-		{ "retries transient failures", retriesTransientFailuresAndPreservesPartialFailures },
-		{ "does not retry permanent failures", doesNotRetryPermanentFailures },
+		{ "retains transient partial failures", retainsTransientPartialFailuresForRetry },
+		{ "rejects duplicate batch identities", rejectsDuplicateBatchIdentitiesBeforeTransport },
+		{ "preserves partial batch identities", preservesPartialBatchRecordIdentity },
+		{ "refuses oversized batch records", refusesRecordThatExceedsBatchLimit },
 		{ "releases pending records on shutdown", releasesPendingRecordsOnShutdown },
 	};
 
