@@ -1,68 +1,99 @@
-# Batch Processing Data Uplink Template for Xentara
-This repository contains skeleton code for a Xentara data uplink with the following features:
+# ReductStore Skill for Xentara
 
-Connection based | Batch processing
-:--------------: | :--------------:
-NO               | YES
+C++20 plugin for Xentara 2.1.1. It writes scheduled scalar snapshots to [ReductStore](https://www.reduct.store/).
 
-## Prerequisites
+| Supported now | Not supported yet |
+| --- | --- |
+| Boolean, signed/unsigned integer, and floating-point measurements | Images, arbitrary binary data, and waveform buffers |
+| JSON snapshots with quality and optional source timestamps | Image and waveform contracts are tracked separately |
 
-This skill template requires the Xentara development environment, as well as a Xentara licence. You can get a Xentara
-licence in the [Xentara Online Shop](https://www.xentara.io/product/xentara-for-industrial-automation/).
+Derived from `xentara/xentara-template-uplink-batch`. Original Boost Software License notices remain in the source.
 
-The documentation for Xentara can be found at https://docs.xentara.io/xentara.
+## Build and run
 
-This skill template uses the Xentara Utility Library, as well as the Xentara Plugin Framework. The corresponding documentation can be found here:
+| Requirement | Version or use |
+| --- | --- |
+| Xentara Runtime and development package | 2.1.1 |
+| Build tools | CMake 3.25+, C++20 compiler, OpenSSL headers |
+| Demo | Docker Compose and a signed `ReductStore` Xentara entitlement |
 
-https://docs.xentara.io/xentara-utils/  
-https://docs.xentara.io/xentara-plugin/
+```sh
+cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+  -DREDUCTSTORE_XENTARA_ENABLE_INTEGRATION_TESTS=ON
+cmake --build build --parallel
+ctest --test-dir build --output-on-failure
+xentara --plugin build/reductstore-xentara.json --model examples/model.json
+```
 
-## Build Environment
+The manifest loads the plugin directly from `build`. The ReductStore C++ SDK is pinned to v1.21.3.
 
-The repository include a [CMakeLists.txt](CMakeLists.txt) file for use with [CMake](https://cmake.org/), which allows you to build the source code
-out of the box, as long as the Xentara development environment is installed. If you whish to use a different build system, you must generate the
-necessary build configuration file yourself.
+## Configuration
 
-## Source Code Documentation
+`@Skill.ReductStore.Client` owns one background uploader. `serverUrl` and `bucket` are required.
 
-The source code in this repository is documented using [Doxygen](https://doxygen.nl/) comments. If you have Doxygen installed, you can
-generate detailed documentation for all classes, functions etc., including a TODO list. To generate the documentation using CMake, just
-build the target *docs* by executing the following command in your [build directory](https://cmake.org/cmake/help/latest/manual/cmake.1.html#generate-a-project-buildsystem):
+| Client field | Default | Purpose |
+| --- | ---: | --- |
+| `serverUrl` | required | ReductStore URL |
+| `apiToken` | empty | ReductStore API token |
+| `bucket` | required | Target bucket |
+| `entryPrefix` | empty | Prefix for every entry. Use one per device. |
+| `host` | `auto` | `host` label value |
+| `createBucket` | `false` | Create the bucket if missing |
+| `connectionTimeout` / `requestTimeout` / `shutdownTimeout` | 2s / 10s / 15s | HTTP and final-flush limits |
+| `maxBatchRecords` | 64 | Records per request |
+| `maxBatchPayloadBytes` / `maxBatchMetadataBytes` | 4 MiB / 6 KiB | Request size limits |
+| `maxBatchAge` | 2s | Maximum time before a flush |
+| `maxQueueBytes` | 16 MiB | Memory limit for pending records |
+| `overflowPolicy` | `rejectNewest` | `rejectNewest` or `dropOldest` |
+| `retry.maxAttempts` / `initialBackoff` / `maximumBackoff` | 3 / 100ms / 2s | Retry cycle and bounded backoff |
 
-~~~sh
-cmake --build . --target docs
-~~~
+`@Skill.ReductStore.Writer` defines one or more `recordGroups`.
 
-This will generate HTML documentation in the subdirectory *docs/html*.
+| Writer field | Required | Purpose |
+| --- | --- | --- |
+| `mode` | yes | `snapshot` |
+| `entry` | yes | Relative ReductStore entry name |
+| `timestampSource` | yes | `scheduled` |
+| `measurements` | yes | JSON object from field name to Xentara data point |
+| `labels` | no | Extra fixed labels. `host` and `quality` are reserved. |
 
-## Xentara Skill Element Templates
+See [`examples/model.json`](examples/model.json) for a complete model.
 
-*(See [Skill Elements](https://docs.xentara.io/xentara/xentara_skills.html#xentara_skill_elements) in the [Xentara documentation](https://docs.xentara.io/xentara/))*
+## How it works
 
-### Client Template
+| Part | Behavior |
+| --- | --- |
+| Collection | `collect` reads all fields in a snapshot. A missing or non-finite field skips the whole snapshot. |
+| Record | Payload is compact JSON with `measurements`, `quality`, and optional `sourceTime` in Unix microseconds. Timestamp is the scheduled pipeline time. |
+| Delivery | Collection only enqueues. A background worker batches records for ReductStore. |
+| Identity | ReductStore identity is entry plus microsecond timestamp. A repeated timestamp is skipped before delivery. |
+| Reliability | Transient HTTP failures retry with bounded backoff. Permanent failures, queue overflow, and shutdown expiry are counted and reported. |
+| Events | `sent` reports new delivery. `sendError` reports new collection or delivery failure. Both may occur in one update. |
+| Status | Client exposes connection, queue, and total delivery state. Writer exposes its own delivery, failure, and collection counters. |
 
-[src/TemplateClient.hpp](src/TemplateClient.hpp)  
-[src/TemplateClient.cpp](src/TemplateClient.cpp)
+## Local demo
 
-The client skill element template provides template code for services that do not require a persistent connection to the service instance.
-Such services are either entirely stateless, or require a single initialization and deinitialization call. This includes web services
-that use the HTTP or HTTPs protocols, for example.
+The demo needs a [Xentara license with the ReductStore skill](https://xentara.io/licensing/).
 
-### Transaction Template
+```sh
+docker compose -f examples/compose.yaml up -d
+xentara --plugin build/reductstore-xentara.json --model examples/model.json
+```
 
-[src/TemplateTransaction.hpp](src/TemplateTransaction.hpp)  
-[src/TemplateTransaction.cpp](src/TemplateTransaction.cpp)
+Open <http://127.0.0.1:8383> to see the `xentara-demo` bucket and its snapshots. The demo token is `xentara-demo-token`.
 
-The transaction skill element template provides template code for transactions that accumulate data over a period of time, and only send it to the service instance
-at greater intervals.
+```sh
+docker compose -f examples/compose.yaml down -v
+```
 
-The template code has the following features:
+## Tests
 
-- The skill element publishes a [Xentara task](https://docs.xentara.io/xentara/xentara_element_members.html#xentara_tasks) called *collect*,
-  which collect a set of records and buffers it for future sending.
-- The skill element publishes a [Xentara task](https://docs.xentara.io/xentara/xentara_element_members.html#xentara_tasks) called *send*,
-  which sends the collected records to the service instance.
-- The *send* task can be executed at greater intervals than the *collect* task, to collect multiple sets of records and send them to the
-  service instance using a single transaction
-- The skill element publishes [Xentara events](https://docs.xentara.io/xentara/xentara_element_members.html#xentara_events) to signal when
-  a transaction was sent, or if a send error occurred.
+| Command | What it checks |
+| --- | --- |
+| `ctest --test-dir build --output-on-failure` | Core behavior and ReductStore integration tests |
+| `tests/integration-recovery.sh` | Queue recovery after a real ReductStore restart |
+| `tests/e2e-demo.sh` | Licensed Xentara model and six-signal snapshot. Uses an isolated temporary container and port. |
+
+## License
+
+Project code is licensed under the Boost Software License 1.0. See [`LICENSE`](LICENSE). ReductStore C++ SDK and Xentara have their own licenses.

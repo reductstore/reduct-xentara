@@ -1,0 +1,12 @@
+services:
+  reductstore:
+    image: reduct/store:v1.21.3
+    ports:
+      - "127.0.0.1:8383:8383"
+    environment:
+      RS_API_TOKEN: xentara-demo-token
+    volumes:
+      - reductstore-data:/data
+
+volumes:
+  reductstore-data:
